@@ -1,0 +1,25 @@
+[workspace]
+resolver = "3"
+members = [
+    "examples/server",
+    "examples/client",
+    "crates/legacy",
+    "crates/server",
+    "crates/raknet/raknet-tokio",
+]
+
+[workspace.dependencies]
+# Submodule / workspace crates
+mineshaft-legacy = { path = "crates/legacy" }
+mineshaft-server = { path = "crates/server" }
+raknet-tokio = { path = "crates/raknet/raknet-tokio" }
+
+# Shared external dependencies
+tokio = { version = "1.53.1", features = ["full"] }
+bytes = "1.12.1"
+socket2 = "0.6.5"
+thiserror = "2.0.20"
+tracing = "0.1.44"
+tracing-subscriber = "0.3.23"
+byteorder = "1.5.0"
+rand = "0.10"

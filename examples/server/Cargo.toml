@@ -1,0 +1,15 @@
+[package]
+name = "mineshaft-example-server"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+mineshaft-legacy = { workspace = true }
+mineshaft-server = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[[bin]]
+name = "mineshaft-example-server"
+path = "main.rs"
