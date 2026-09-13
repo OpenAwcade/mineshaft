@@ -225,34 +225,28 @@ async fn handle_client(
                 let kind = data.split(' ').next().unwrap_or("?").to_string();
                 // joiner -> host: target_sender_id identifies the host
                 // host -> joiner: target_sender_id == 0, route via session map
-                let dest = if target_sender_id != 0 {
-                    let host = registry.lock().await.hosts.get(&target_sender_id).copied();
-                    if let Some(host) = host {
-                        registry
-                            .lock()
-                            .await
-                            .sessions
-                            .insert(connection_id, (addr, host));
-                        info!(
-                            "signal {} conn {} from {} -> host {} (target {:#x})",
-                            kind, connection_id, addr, host, target_sender_id
-                        );
+                let dest = {
+                    let mut reg = registry.lock().await;
+                    if target_sender_id != 0 {
+                        let host = reg.hosts.get(&target_sender_id).copied();
+                        if let Some(host) = host {
+                            reg.sessions.insert(connection_id, (addr, host));
+                            info!(
+                                "signal {} conn {} from {} -> host {} (target {:#x})",
+                                kind, connection_id, addr, host, target_sender_id
+                            );
+                        }
+                        host
+                    } else {
+                        let joiner = reg.sessions.get(&connection_id).map(|(j, _)| *j);
+                        if let Some(j) = joiner {
+                            debug!(
+                                "signal {} conn {} from host -> joiner {}",
+                                kind, connection_id, j
+                            );
+                        }
+                        joiner
                     }
-                    host
-                } else {
-                    let joiner = registry
-                        .lock()
-                        .await
-                        .sessions
-                        .get(&connection_id)
-                        .map(|(j, _)| *j);
-                    if let Some(j) = joiner {
-                        debug!(
-                            "signal {} conn {} from host -> joiner {}",
-                            kind, connection_id, j
-                        );
-                    }
-                    joiner
                 };
                 match dest {
                     Some(dest) => {
