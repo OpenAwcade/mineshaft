@@ -33,10 +33,17 @@ pub type SharedDiscoveryService = Arc<DiscoveryService>;
 /// lifecycle for negotiation.
 pub struct DiscoveryService {
     config: DiscoveryConfig,
-    advertised: RwLock<HashMap<u64, ServerAdvertisement>>,
+    advertised: RwLock<HashMap<u64, CachedAdvertisement>>,
     signaling: Arc<LanSignaling>,
     cancel: CancellationToken,
     task: tokio::sync::Mutex<Option<JoinHandle<()>>>,
+}
+
+/// An advertised server together with its pre-marshaled discovery response,
+/// rebuilt only when the registry changes rather than on every heartbeat.
+struct CachedAdvertisement {
+    data: ServerAdvertisement,
+    packet: Arc<[u8]>,
 }
 
 impl DiscoveryService {
@@ -84,10 +91,17 @@ impl DiscoveryService {
 
     /// Register an advertised server entry.
     pub fn advertise(&self, sender_id: u64, data: ServerAdvertisement) {
-        self.advertised
-            .write()
-            .expect("advertised registry poisoned")
-            .insert(sender_id, data);
+        match build_response_packet(sender_id, &data) {
+            Ok(packet) => {
+                self.advertised
+                    .write()
+                    .expect("advertised registry poisoned")
+                    .insert(sender_id, CachedAdvertisement { data, packet });
+            }
+            Err(e) => {
+                tracing::warn!("failed to marshal discovery response: {}", e);
+            }
+        }
     }
 
     /// Remove an advertised server entry.
@@ -104,9 +118,29 @@ impl DiscoveryService {
             .advertised
             .write()
             .expect("advertised registry poisoned");
-        guard.clear();
+        // Drop entries that are no longer advertised
+        guard.retain(|sender_id, _| entries.iter().any(|e| e.sender_id == *sender_id));
         for entry in entries {
-            guard.insert(entry.sender_id, entry.data);
+            // Skip re-marshaling when the advertisement has not changed
+            if let Some(existing) = guard.get(&entry.sender_id)
+                && existing.data == entry.data
+            {
+                continue;
+            }
+            match build_response_packet(entry.sender_id, &entry.data) {
+                Ok(packet) => {
+                    guard.insert(
+                        entry.sender_id,
+                        CachedAdvertisement {
+                            data: entry.data,
+                            packet,
+                        },
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!("failed to marshal discovery response: {}", e);
+                }
+            }
         }
     }
 
@@ -118,7 +152,7 @@ impl DiscoveryService {
             .iter()
             .map(|(sender_id, data)| AdvertisedServer {
                 sender_id: *sender_id,
-                data: data.clone(),
+                data: data.data.clone(),
             })
             .collect()
     }
@@ -157,17 +191,15 @@ impl DiscoveryService {
     }
 
     async fn broadcast_once(&self, targets: &[SocketAddr]) {
-        let entries = self.advertised();
+        let packets: Vec<Arc<[u8]>> = self
+            .advertised
+            .read()
+            .expect("advertised registry poisoned")
+            .values()
+            .map(|entry| entry.packet.clone())
+            .collect();
         let socket = self.signaling.socket();
-        for entry in entries {
-            let packet = match build_response_packet(&entry) {
-                Ok(packet) => packet,
-                Err(e) => {
-                    tracing::warn!("failed to marshal discovery response: {}", e);
-                    continue;
-                }
-            };
-
+        for packet in packets {
             for target in targets {
                 if let Err(e) = socket.send_to(&packet, target).await {
                     tracing::trace!("advertisement send to {} failed: {}", target, e);
@@ -177,24 +209,24 @@ impl DiscoveryService {
     }
 }
 
-fn build_response_packet(entry: &AdvertisedServer) -> Result<Vec<u8>> {
-    let data = ServerData {
-        server_name: entry.data.server_name.clone(),
-        level_name: entry.data.level_name.clone(),
-        game_type: entry.data.game_type,
-        player_count: entry.data.player_count,
-        max_player_count: entry.data.max_player_count,
-        editor_world: entry.data.editor_world,
-        hardcore: entry.data.hardcore,
-        flag_a: entry.data.flag_a,
-        flag_b: entry.data.flag_b,
-        session_id: entry.data.session_id.clone(),
-        transport_layer: entry.data.transport_layer,
-        connection_type: entry.data.connection_type,
+fn build_response_packet(sender_id: u64, data: &ServerAdvertisement) -> Result<Arc<[u8]>> {
+    let server_data = ServerData {
+        server_name: data.server_name.clone(),
+        level_name: data.level_name.clone(),
+        game_type: data.game_type,
+        player_count: data.player_count,
+        max_player_count: data.max_player_count,
+        editor_world: data.editor_world,
+        hardcore: data.hardcore,
+        flag_a: data.flag_a,
+        flag_b: data.flag_b,
+        session_id: data.session_id.clone(),
+        transport_layer: data.transport_layer,
+        connection_type: data.connection_type,
     };
 
-    let response = ResponsePacket::new(data.marshal()?);
-    Ok(discovery::marshal(&response, entry.sender_id)?)
+    let response = ResponsePacket::new(server_data.marshal()?);
+    Ok(discovery::marshal(&response, sender_id)?.into())
 }
 
 impl Drop for DiscoveryService {
