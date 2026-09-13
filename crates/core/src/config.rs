@@ -3,7 +3,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 /// Static server metadata advertised to the local Minecraft client.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServerAdvertisement {
     /// Name shown as the server owner in the LAN list.
     pub server_name: String,
@@ -64,7 +64,7 @@ pub struct DiscoveryConfig {
 impl Default for DiscoveryConfig {
     fn default() -> Self {
         Self {
-            heartbeat_interval: Duration::from_millis(500),
+            heartbeat_interval: Duration::from_secs(1),
             local_targets: vec![
                 "[::1]:7551".parse().expect("valid v6 target"),
                 "127.0.0.1:7551".parse().expect("valid v4 target"),
