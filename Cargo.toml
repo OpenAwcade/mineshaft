@@ -1,16 +1,26 @@
 [workspace]
 resolver = "3"
 members = [
+    "crates/core",
+    "crates/platform/windows",
+    "crates/platform/linux",
+    "crates/platform/android",
+    "crates/nethernet/nethernet-tokio",
     "examples/server",
     "examples/client",
-    "crates/raknet/raknet-tokio",
-    "crates/nethernet/nethernet-tokio"
+]
+
+exclude = [
+    "crates/raknet",
 ]
 
 [workspace.dependencies]
 # Submodule / workspace crates
-raknet = { package = "raknet-tokio", path = "crates/raknet/raknet-tokio" }
 nethernet = { package = "nethernet-tokio", path = "crates/nethernet/nethernet-tokio" }
+mineshaft-core = { path = "crates/core" }
+mineshaft-windows = { path = "crates/platform/windows" }
+mineshaft-linux = { path = "crates/platform/linux" }
+mineshaft-android = { path = "crates/platform/android" }
 
 # Shared external dependencies
 tokio = { version = "1.53.1", features = ["full"] }
@@ -29,7 +39,14 @@ sha2 = "0.11.0"
 hmac = "0.13.0"
 hex = "0.4.3"
 serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0"
 url = "2.5.8"
 reqwest = { version = "0.13.5", default-features = false, features = ["rustls-no-provider", "http2", "charset"] }
 rustls = { version = "0.23.44", default-features = false, features = ["ring"] }
 webrtc = "0.17.2"
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Diagnostics_ToolHelp",
+] }

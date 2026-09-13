@@ -1,0 +1,25 @@
+[package]
+name = "mineshaft-core"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+nethernet = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+bytes = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+futures = { workspace = true }
+rand = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+mineshaft-windows = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+mineshaft-linux = { workspace = true }
+
+[target.'cfg(target_os = "android")'.dependencies]
+mineshaft-android = { workspace = true }

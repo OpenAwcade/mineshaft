@@ -1,0 +1,8 @@
+[package]
+name = "mineshaft-linux"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+socket2 = { workspace = true }
+thiserror = { workspace = true }

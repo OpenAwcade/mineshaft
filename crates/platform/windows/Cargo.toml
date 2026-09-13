@@ -1,0 +1,12 @@
+[package]
+name = "mineshaft-windows"
+version = "0.1.0"
+edition = "2024"
+
+[target.'cfg(windows)'.dependencies]
+thiserror = { workspace = true }
+windows = { workspace = true }
+
+[dependencies]
+socket2 = { workspace = true }
+thiserror = { workspace = true }
