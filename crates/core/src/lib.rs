@@ -14,7 +14,7 @@ pub mod session;
 pub mod transport;
 
 pub use config::{DiscoveryConfig, RelayConfig, ServerAdvertisement};
-pub use discovery::{AdvertisedServer, DiscoveryEvent, DiscoveryService, SharedDiscoveryService};
+pub use discovery::{AdvertisedServer, DiscoveryService, SharedDiscoveryService};
 pub use error::{CoreError, Result};
 pub use relay::{RelayCommand, RelayService, SharedRelayService};
 pub use session::{SessionRegistry, SessionSummary};
