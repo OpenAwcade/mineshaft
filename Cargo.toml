@@ -3,16 +3,12 @@ resolver = "3"
 members = [
     "examples/server",
     "examples/client",
-    "crates/legacy",
-    "crates/server",
     "crates/raknet/raknet-tokio",
     "crates/nethernet/nethernet-tokio"
 ]
 
 [workspace.dependencies]
 # Submodule / workspace crates
-mineshaft-legacy = { path = "crates/legacy" }
-mineshaft-server = { path = "crates/server" }
 raknet = { package = "raknet-tokio", path = "crates/raknet/raknet-tokio" }
 nethernet = { package = "nethernet-tokio", path = "crates/nethernet/nethernet-tokio" }
 
