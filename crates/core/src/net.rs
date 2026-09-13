@@ -30,6 +30,18 @@ pub enum ClientMessage {
         /// Network ID of the joiner (so the host knows who is coming).
         joiner_network_id: u64,
     },
+    /// Forward a raw WebRTC signaling message (`CONNECTREQUEST <conn> <sdp>`,
+    /// `CANDIDATEADD <conn> <candidate>`, ...) toward the host.
+    Signal {
+        /// Advertised sender id the player clicked.
+        target_sender_id: u64,
+        /// WebRTC connection id inside the message.
+        connection_id: u64,
+        /// This node's network id (the host presents it as the peer).
+        joiner_network_id: u64,
+        /// Raw signaling line.
+        data: String,
+    },
 }
 
 /// Messages the rendezvous server sends back to clients.
@@ -46,6 +58,22 @@ pub enum ServerMessage {
     IncomingJoin {
         /// Network ID of the joining node.
         joiner_network_id: u64,
+        /// Relay session id assigned by the server.
+        session_id: u64,
+    },
+    /// Server accepted the join; carries the relay session id.
+    JoinAccepted {
+        /// Relay session id assigned by the server.
+        session_id: u64,
+    },
+    /// A signaling message forwarded from the other side of the tunnel.
+    Signal {
+        /// WebRTC connection id inside the message.
+        connection_id: u64,
+        /// Network id of the joiner (presented as the sender to the game).
+        joiner_network_id: u64,
+        /// Raw signaling line.
+        data: String,
     },
     /// Generic error surfaced to the client.
     Error(String),

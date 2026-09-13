@@ -90,12 +90,16 @@ pub fn set_protect_socket_callback<F>(callback: F)
 where
     F: Fn(i32) -> bool + Send + Sync + 'static,
 {
-    *protect_socket_slot().lock().expect("protect socket mutex poisoned") = Some(Box::new(callback));
+    *protect_socket_slot()
+        .lock()
+        .expect("protect socket mutex poisoned") = Some(Box::new(callback));
 }
 
 /// Clears the previously registered socket-protection callback.
 pub fn clear_protect_socket_callback() {
-    *protect_socket_slot().lock().expect("protect socket mutex poisoned") = None;
+    *protect_socket_slot()
+        .lock()
+        .expect("protect socket mutex poisoned") = None;
 }
 
 /// Invokes the registered socket-protection callback, if any.
@@ -103,7 +107,9 @@ pub fn clear_protect_socket_callback() {
 /// Returns `Ok(true)` when the socket was protected or when no callback is
 /// registered (treated as no-op success).
 pub fn protect_socket(fd: i32) -> bool {
-    let guard = protect_socket_slot().lock().expect("protect socket mutex poisoned");
+    let guard = protect_socket_slot()
+        .lock()
+        .expect("protect socket mutex poisoned");
     match guard.as_ref() {
         Some(callback) => callback(fd),
         None => true,
@@ -154,7 +160,9 @@ fn proc_visible_matches(names: &[&str]) -> Option<bool> {
 
         let cmdline_path = entry.path().join("cmdline");
         if let Ok(cmdline) = fs::read(&cmdline_path) {
-            let haystack = String::from_utf8_lossy(&cmdline).replace('\0', " ").to_lowercase();
+            let haystack = String::from_utf8_lossy(&cmdline)
+                .replace('\0', " ")
+                .to_lowercase();
             if names
                 .iter()
                 .any(|candidate| haystack.contains(&candidate.to_lowercase()))
@@ -173,13 +181,11 @@ mod tests {
     use std::sync::atomic::{AtomicI32, Ordering};
 
     #[test]
-    fn protect_socket_defaults_to_success_without_callback() {
+    fn protect_socket_callback_lifecycle() {
+        // Single test: the callback slot is global, so parallel tests would race.
         clear_protect_socket_callback();
         assert!(protect_socket(42));
-    }
 
-    #[test]
-    fn protect_socket_invokes_registered_callback() {
         static SEEN: AtomicI32 = AtomicI32::new(-1);
         set_protect_socket_callback(|fd| {
             SEEN.store(fd, Ordering::SeqCst);
@@ -192,5 +198,6 @@ mod tests {
         assert_eq!(SEEN.load(Ordering::SeqCst), 7);
 
         clear_protect_socket_callback();
+        assert!(protect_socket(42));
     }
 }

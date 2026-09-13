@@ -63,7 +63,8 @@ mod imp {
         GetExtendedUdpTable, MIB_UDPTABLE_OWNER_PID, UDP_TABLE_OWNER_PID,
     };
     use windows::Win32::System::Diagnostics::ToolHelp::{
-        CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
+        CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
+        TH32CS_SNAPPROCESS,
     };
 
     pub fn udp_port_bound_impl(port: u16) -> Result<bool> {
@@ -230,7 +231,10 @@ mod tests {
     #[cfg(not(windows))]
     #[test]
     fn non_windows_stub_reports_unsupported() {
-        assert!(matches!(udp_port_bound(7551), Err(PlatformError::Unsupported)));
+        assert!(matches!(
+            udp_port_bound(7551),
+            Err(PlatformError::Unsupported)
+        ));
         assert!(!minecraft_process_running());
     }
 }

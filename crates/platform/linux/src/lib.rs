@@ -142,7 +142,9 @@ fn proc_cmdline_matches(names: &[&str]) -> bool {
         let Ok(cmdline) = fs::read(&cmdline_path) else {
             continue;
         };
-        let haystack = String::from_utf8_lossy(&cmdline).replace('\0', " ").to_lowercase();
+        let haystack = String::from_utf8_lossy(&cmdline)
+            .replace('\0', " ")
+            .to_lowercase();
         if names
             .iter()
             .any(|candidate| haystack.contains(&candidate.to_lowercase()))
@@ -199,7 +201,8 @@ mod tests {
         let port = 39_999;
         assert!(!udp_port_bound(port).unwrap());
 
-        let socket = std::net::UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port)).unwrap();
+        let socket =
+            std::net::UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port)).unwrap();
         assert!(udp_port_bound(port).unwrap());
 
         drop(socket);

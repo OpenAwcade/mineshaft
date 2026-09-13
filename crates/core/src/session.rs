@@ -72,6 +72,9 @@ impl SessionRegistry {
 
     /// Number of tracked sessions.
     pub fn len(&self) -> usize {
-        self.sessions.read().expect("session registry poisoned").len()
+        self.sessions
+            .read()
+            .expect("session registry poisoned")
+            .len()
     }
 }

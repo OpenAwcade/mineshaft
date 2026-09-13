@@ -1513,6 +1513,7 @@ dependencies = [
 name = "mineshaft-example-client"
 version = "0.1.0"
 dependencies = [
+ "futures",
  "mineshaft-core",
  "nethernet-tokio",
  "rand 0.10.2",

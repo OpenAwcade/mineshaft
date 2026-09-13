@@ -11,7 +11,7 @@ use mineshaft_core::net::{ClientMessage, ServerMessage, read_message, write_mess
 use mineshaft_core::{AdvertisedServer, ServerAdvertisement};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, mpsc};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// Default listen address for the rendezvous server.
 const BIND_ADDR: &str = "0.0.0.0:25000";
@@ -29,6 +29,10 @@ struct Registry {
     hosts: HashMap<u64, SocketAddr>,
     /// sender_id -> full advertised record (for serving HostList).
     host_records: HashMap<u64, mineshaft_core::AdvertisedServer>,
+    /// session_id -> (joiner addr, host addr) relay pairing.
+    sessions: HashMap<u64, (SocketAddr, SocketAddr)>,
+    /// next relay session id
+    next_session_id: u64,
 }
 
 #[tokio::main]
@@ -37,11 +41,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .with_max_level(tracing::Level::INFO)
         .init();
 
-    let bind = std::env::args().nth(1).unwrap_or_else(|| BIND_ADDR.to_string());
+    let bind = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| BIND_ADDR.to_string());
     let listener = TcpListener::bind(&bind).await?;
     info!("rendezvous server listening on {}", bind);
 
     let registry = Arc::new(Mutex::new(Registry::default()));
+
+    {
+        let mut reg = registry.lock().await;
+        reg.next_session_id = 1;
+    }
 
     // Permanent dummy host so browsing clients always see something.
     {
@@ -128,9 +139,13 @@ async fn handle_client(
                     reg.hosts.insert(server.sender_id, addr);
                     reg.host_records.insert(server.sender_id, server.clone());
                 }
-                send_to(&registry, addr, ServerMessage::Registered {
-                    sender_id: server.sender_id,
-                })
+                send_to(
+                    &registry,
+                    addr,
+                    ServerMessage::Registered {
+                        sender_id: server.sender_id,
+                    },
+                )
                 .await;
             }
             ClientMessage::UnregisterHost { sender_id } => {
@@ -149,7 +164,11 @@ async fn handle_client(
                     .values()
                     .cloned()
                     .collect();
-                info!("client {} requested host list ({} entries)", addr, hosts.len());
+                info!(
+                    "client {} requested host list ({} entries)",
+                    addr,
+                    hosts.len()
+                );
                 send_to(&registry, addr, ServerMessage::HostList(hosts)).await;
             }
             ClientMessage::ConnectRequest {
@@ -159,16 +178,27 @@ async fn handle_client(
                 let host_addr = registry.lock().await.hosts.get(&target_sender_id).copied();
                 match host_addr {
                     Some(host_addr) => {
+                        let session_id = {
+                            let mut reg = registry.lock().await;
+                            let id = reg.next_session_id;
+                            reg.next_session_id += 1;
+                            reg.sessions.insert(id, (addr, host_addr));
+                            id
+                        };
                         info!(
-                            "client {} wants to join {:#x} (relaying to host {})",
-                            addr, target_sender_id, host_addr
+                            "client {} wants to join {:#x} -> session {} (host {})",
+                            addr, target_sender_id, session_id, host_addr
                         );
                         send_to(
                             &registry,
                             host_addr,
-                            ServerMessage::IncomingJoin { joiner_network_id },
+                            ServerMessage::IncomingJoin {
+                                joiner_network_id,
+                                session_id,
+                            },
                         )
                         .await;
+                        send_to(&registry, addr, ServerMessage::JoinAccepted { session_id }).await;
                     }
                     None => {
                         warn!(
@@ -178,13 +208,64 @@ async fn handle_client(
                         send_to(
                             &registry,
                             addr,
-                            ServerMessage::Error(format!(
-                                "no such host: {:#x}",
-                                target_sender_id
-                            )),
+                            ServerMessage::Error(format!("no such host: {:#x}", target_sender_id)),
                         )
                         .await;
                     }
+                }
+            }
+            ClientMessage::Signal {
+                target_sender_id,
+                connection_id,
+                joiner_network_id,
+                data,
+            } => {
+                let kind = data.split(' ').next().unwrap_or("?").to_string();
+                // joiner -> host: target_sender_id identifies the host
+                // host -> joiner: target_sender_id == 0, route via session map
+                let dest = if target_sender_id != 0 {
+                    let host = registry.lock().await.hosts.get(&target_sender_id).copied();
+                    if let Some(host) = host {
+                        registry
+                            .lock()
+                            .await
+                            .sessions
+                            .insert(connection_id, (addr, host));
+                        info!(
+                            "signal {} conn {} from {} -> host {} (target {:#x})",
+                            kind, connection_id, addr, host, target_sender_id
+                        );
+                    }
+                    host
+                } else {
+                    let joiner = registry
+                        .lock()
+                        .await
+                        .sessions
+                        .get(&connection_id)
+                        .map(|(j, _)| *j);
+                    if let Some(j) = joiner {
+                        debug!(
+                            "signal {} conn {} from host -> joiner {}",
+                            kind, connection_id, j
+                        );
+                    }
+                    joiner
+                };
+                match dest {
+                    Some(dest) => {
+                        send_to(
+                            &registry,
+                            dest,
+                            ServerMessage::Signal {
+                                connection_id,
+                                joiner_network_id,
+                                data,
+                            },
+                        )
+                        .await;
+                    }
+                    None => warn!("no route for signal conn {} from {}", connection_id, addr),
                 }
             }
         }

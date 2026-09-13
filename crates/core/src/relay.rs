@@ -83,8 +83,7 @@ impl RelayService {
     /// Register or replace an advertised host.
     pub fn register_host(&self, server: AdvertisedServer) {
         let mut hosts = self.hosts.write().expect("relay hosts poisoned");
-        if hosts.len() >= self.config.max_advertised_hosts
-            && !hosts.contains_key(&server.sender_id)
+        if hosts.len() >= self.config.max_advertised_hosts && !hosts.contains_key(&server.sender_id)
         {
             if let Some(oldest) = hosts.keys().next().copied() {
                 hosts.remove(&oldest);
