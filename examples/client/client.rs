@@ -162,6 +162,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         if server.is_none() {
             match TcpStream::connect(&server_addr).await {
                 Ok(stream) => {
+                    // Signaling frames are small and latency-sensitive; disable Nagle.
+                    let _ = stream.set_nodelay(true);
                     info!("connected to rendezvous server {}", server_addr);
                     let (mut read_half, write_half) = stream.into_split();
                     let write_half = Arc::new(tokio::sync::Mutex::new(write_half));

@@ -73,6 +73,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     loop {
         let (stream, addr) = listener.accept().await?;
+        // Signaling frames are small and latency-sensitive; disable Nagle.
+        let _ = stream.set_nodelay(true);
         info!("client connected: {}", addr);
         let registry = registry.clone();
         tokio::spawn(async move {
