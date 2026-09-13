@@ -17,8 +17,30 @@ use mineshaft_core::{
 use tokio::net::TcpStream;
 use tracing::{debug, info, warn};
 
-const SERVER_ADDR: &str = "127.0.0.1:25000";
+const DEFAULT_SERVER_ADDR: &str = "127.0.0.1:25000";
 const LOOP_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Resolve the rendezvous server address.
+///
+/// Priority: `--server <addr>` flag > positional arg > `MINESHAFT_SERVER`
+/// env var > default.
+fn resolve_server_addr() -> String {
+    let args: Vec<String> = std::env::args().collect();
+    if let Some(pos) = args.iter().position(|a| a == "--server") {
+        if let Some(addr) = args.get(pos + 1) {
+            return addr.clone();
+        }
+    }
+    if let Some(addr) = args.iter().skip(1).find(|a| !a.starts_with('-')) {
+        return addr.clone();
+    }
+    if let Ok(addr) = std::env::var("MINESHAFT_SERVER") {
+        if !addr.is_empty() {
+            return addr;
+        }
+    }
+    DEFAULT_SERVER_ADDR.to_string()
+}
 
 /// What the local game is doing with UDP 7551 right now.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,8 +59,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .with_max_level(tracing::Level::INFO)
         .init();
 
-    let server_addr = std::env::args().nth(1).unwrap_or_else(|| SERVER_ADDR.to_string());
-    info!("mineshaft node starting, rendezvous server: {}", server_addr);
+    let server_addr = resolve_server_addr();
+    info!(
+        "mineshaft node starting, rendezvous server: {}",
+        server_addr
+    );
 
     // Ephemeral advertiser — never binds 7551 itself.
     let discovery = DiscoveryService::new(DiscoveryConfig::default()).await?;
@@ -93,7 +118,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     info!("game closed; unregistering host");
                     send_or_drop(
                         &mut server,
-                        &ClientMessage::UnregisterHost { sender_id: my_network_id },
+                        &ClientMessage::UnregisterHost {
+                            sender_id: my_network_id,
+                        },
                     )
                     .await;
                     hosting_registered = false;
@@ -132,7 +159,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     info!("user left world, now browsing — unregistering host");
                     send_or_drop(
                         &mut server,
-                        &ClientMessage::UnregisterHost { sender_id: my_network_id },
+                        &ClientMessage::UnregisterHost {
+                            sender_id: my_network_id,
+                        },
                     )
                     .await;
                     hosting_registered = false;
