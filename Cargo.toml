@@ -6,13 +6,15 @@ members = [
     "crates/legacy",
     "crates/server",
     "crates/raknet/raknet-tokio",
+    "crates/nethernet/nethernet-tokio"
 ]
 
 [workspace.dependencies]
 # Submodule / workspace crates
 mineshaft-legacy = { path = "crates/legacy" }
 mineshaft-server = { path = "crates/server" }
-raknet-tokio = { path = "crates/raknet/raknet-tokio" }
+raknet = { package = "raknet-tokio", path = "crates/raknet/raknet-tokio" }
+nethernet = { package = "nethernet-tokio", path = "crates/nethernet/nethernet-tokio" }
 
 # Shared external dependencies
 tokio = { version = "1.53.1", features = ["full"] }

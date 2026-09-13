@@ -6,7 +6,7 @@ edition = "2024"
 
 [dependencies]
 mineshaft-server = { workspace = true }
-raknet-tokio = { workspace = true }
+raknet = { workspace = true }
 tokio = { workspace = true }
 bytes = { workspace = true }
 socket2 = { workspace = true }

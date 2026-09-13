@@ -1,3 +1,7 @@
 [submodule "crates/raknet"]
 	path = crates/raknet
 	url = https://github.com/bedrock-crustaceans/raknet.git
+[submodule "crates/nethernet"]
+	path = crates/nethernet
+	url = https://github.com/OpenAwcade/nethernet.git
+	branch = master
