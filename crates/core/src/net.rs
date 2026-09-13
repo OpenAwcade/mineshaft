@@ -110,10 +110,11 @@ where
 {
     let payload = serde_json::to_vec(msg)
         .map_err(|e| CoreError::Other(format!("json encode failed: {}", e)))?;
-    stream
-        .write_all(&(payload.len() as u32).to_le_bytes())
-        .await?;
-    stream.write_all(&payload).await?;
+    // Length prefix + payload in a single buffer so each frame is one write syscall.
+    let mut frame = Vec::with_capacity(4 + payload.len());
+    frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    frame.extend_from_slice(&payload);
+    stream.write_all(&frame).await?;
     stream.flush().await?;
     Ok(())
 }
