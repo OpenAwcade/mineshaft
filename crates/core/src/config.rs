@@ -64,7 +64,7 @@ pub struct DiscoveryConfig {
 impl Default for DiscoveryConfig {
     fn default() -> Self {
         Self {
-            heartbeat_interval: Duration::from_secs(1),
+            heartbeat_interval: Duration::from_millis(500),
             local_targets: vec![
                 "[::1]:7551".parse().expect("valid v6 target"),
                 "127.0.0.1:7551".parse().expect("valid v4 target"),
