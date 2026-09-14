@@ -6,15 +6,25 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
-use mineshaft_core::net::{ClientMessage, ServerMessage, read_message, write_message};
-use mineshaft_core::{AdvertisedServer, ServerAdvertisement};
+use mineshaft_core::CoreError;
+use mineshaft_core::net::{
+    ClientMessage, ServerMessage, read_message, set_tcp_keepalive, write_message,
+};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, mpsc};
 use tracing::{debug, info, warn};
 
 /// Default listen address for the rendezvous server.
 const BIND_ADDR: &str = "0.0.0.0:25000";
+
+/// Close connections that have been completely silent for this long.
+///
+/// Clients send [`ClientMessage::Ping`] every few seconds even while hosting,
+/// so a connection silent for this long is dead (e.g. a NAT or
+/// port-forwarder idle drop that never delivered a FIN/RST).
+const CLIENT_IDLE_TIMEOUT: Duration = Duration::from_secs(45);
 
 /// A connected client with an optional registered host entry.
 struct ClientHandle {
@@ -38,7 +48,7 @@ struct Registry {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::INFO)
+        .with_max_level(tracing::Level::DEBUG)
         .init();
 
     let bind = std::env::args()
@@ -54,35 +64,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         reg.next_session_id = 1;
     }
 
-    // Permanent dummy host so browsing clients always see something.
-    {
-        let mut ad = ServerAdvertisement::default();
-        ad.server_name = "mineshaft dummy".to_string();
-        ad.level_name = "Dummy World".to_string();
-        ad.player_count = 1;
-        ad.max_player_count = 8;
-        ad.session_id = "00000000deadbeef".to_string();
-        let dummy = AdvertisedServer {
-            sender_id: 0x00000000deadbeef,
-            data: ad,
-        };
-        let mut reg = registry.lock().await;
-        reg.host_records.insert(dummy.sender_id, dummy);
-        info!("dummy host {:#x} seeded (permanent)", 0xdeadbeefu64);
-    }
-
     loop {
         let (stream, addr) = listener.accept().await?;
         // Signaling frames are small and latency-sensitive; disable Nagle.
         let _ = stream.set_nodelay(true);
+        // Detect silently dropped connections even when no traffic flows.
+        let _ = set_tcp_keepalive(&stream);
         info!("client connected: {}", addr);
         let registry = registry.clone();
         tokio::spawn(async move {
             if let Err(e) = handle_client(stream, addr, registry.clone()).await {
-                warn!("client {} error: {}", addr, e);
+                match e {
+                    CoreError::FrameTooLarge(len) => info!(
+                        "client {} sent an oversized frame ({} bytes); closing \
+                         (most likely not a mineshaft peer)",
+                        addr, len
+                    ),
+                    other => warn!("client {} error: {}", addr, other),
+                }
             }
             let mut reg = registry.lock().await;
             reg.clients.remove(&addr);
+            // Relay sessions involving this client are dead too.
+            reg.sessions
+                .retain(|_, (joiner, host)| *joiner != addr && *host != addr);
             let orphaned: Vec<u64> = reg
                 .hosts
                 .iter()
@@ -112,25 +117,48 @@ async fn handle_client(
         .insert(addr, ClientHandle { tx });
 
     let (mut read_half, mut write_half) = stream.into_split();
-    let writer = tokio::spawn(async move {
-        while let Some(msg) = rx.recv().await {
-            if write_message(&mut write_half, &msg).await.is_err() {
-                break;
+    // If the writer dies the connection is unusable: wake the read loop so
+    // the whole connection is torn down instead of lingering half-open with
+    // messages silently accumulating in the channel.
+    let writer_dead = Arc::new(tokio::sync::Notify::new());
+    let writer = tokio::spawn({
+        let writer_dead = writer_dead.clone();
+        async move {
+            while let Some(msg) = rx.recv().await {
+                if write_message(&mut write_half, &msg).await.is_err() {
+                    break;
+                }
             }
+            writer_dead.notify_one();
         }
     });
 
     loop {
-        let msg: Option<ClientMessage> = match read_message(&mut read_half).await {
-            Ok(msg) => msg,
-            Err(e) => {
-                writer.abort();
-                return Err(e);
+        let msg: Option<ClientMessage> = tokio::select! {
+            _ = writer_dead.notified() => {
+                warn!("client {} writer failed; closing connection", addr);
+                break;
+            }
+            result = tokio::time::timeout(CLIENT_IDLE_TIMEOUT, read_message(&mut read_half)) => {
+                match result {
+                    Ok(Ok(msg)) => msg,
+                    Ok(Err(e)) => {
+                        writer.abort();
+                        return Err(e);
+                    }
+                    Err(_) => {
+                        info!("client {} silent for {:?}; closing connection", addr, CLIENT_IDLE_TIMEOUT);
+                        break;
+                    }
+                }
             }
         };
         let Some(msg) = msg else { break };
 
         match msg {
+            ClientMessage::Ping => {
+                send_to(&registry, addr, ServerMessage::Pong).await;
+            }
             ClientMessage::RegisterHost(server) => {
                 info!(
                     "client {} registered host '{}'/'{}' ({:#x})",
@@ -150,12 +178,40 @@ async fn handle_client(
                 )
                 .await;
             }
+            ClientMessage::UpdateHost(server) => {
+                let updated = {
+                    let mut reg = registry.lock().await;
+                    if reg.hosts.get(&server.sender_id).copied() == Some(addr) {
+                        reg.host_records.insert(server.sender_id, server.clone());
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if updated {
+                    info!(
+                        "client {} updated host '{}'/'{}' ({} players, {:#x})",
+                        addr,
+                        server.data.server_name,
+                        server.data.level_name,
+                        server.data.player_count,
+                        server.sender_id
+                    );
+                } else {
+                    warn!(
+                        "client {} attempted to update unregistered host {:#x}",
+                        addr, server.sender_id
+                    );
+                }
+            }
             ClientMessage::UnregisterHost { sender_id } => {
                 info!("client {} unregistered host {:#x}", addr, sender_id);
                 {
                     let mut reg = registry.lock().await;
-                    reg.hosts.remove(&sender_id);
-                    reg.host_records.remove(&sender_id);
+                    if reg.hosts.get(&sender_id).copied() == Some(addr) {
+                        reg.hosts.remove(&sender_id);
+                        reg.host_records.remove(&sender_id);
+                    }
                 }
             }
             ClientMessage::ListHosts => {

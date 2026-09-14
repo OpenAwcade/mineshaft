@@ -11,6 +11,8 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use crate::discovery::AdvertisedServer;
 use crate::error::{CoreError, Result};
 
+pub const MAX_FRAME_BYTES: usize = 512 * 1024;
+
 /// Messages a client sends to the rendezvous server.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ClientMessage {
@@ -42,6 +44,14 @@ pub enum ClientMessage {
         /// Raw signaling line.
         data: String,
     },
+    /// Keepalive ping; the server answers with [`ServerMessage::Pong`].
+    ///
+    /// Keeps NAT and port-forwarder state alive on otherwise idle connections
+    /// (a hosting client sends nothing else) and lets both sides detect a
+    /// silently dropped connection.
+    Ping,
+    /// Update the metadata of a host that this client already registered.
+    UpdateHost(AdvertisedServer),
 }
 
 /// Messages the rendezvous server sends back to clients.
@@ -75,6 +85,8 @@ pub enum ServerMessage {
         /// Raw signaling line.
         data: String,
     },
+    /// Answer to [`ClientMessage::Ping`].
+    Pong,
     /// Generic error surfaced to the client.
     Error(String),
 }
@@ -92,8 +104,8 @@ where
         Err(e) => return Err(CoreError::Io(e)),
     }
     let len = u32::from_le_bytes(len_buf) as usize;
-    if len > 1024 * 1024 {
-        return Err(CoreError::Other(format!("frame too large: {} bytes", len)));
+    if len > MAX_FRAME_BYTES {
+        return Err(CoreError::FrameTooLarge(len));
     }
     let mut buf = vec![0u8; len];
     stream.read_exact(&mut buf).await?;
@@ -116,5 +128,24 @@ where
     frame.extend_from_slice(&payload);
     stream.write_all(&frame).await?;
     stream.flush().await?;
+    Ok(())
+}
+
+/// Enable aggressive TCP keepalive on a rendezvous connection.
+///
+/// A hosting client is otherwise completely silent on the connection, so a
+/// silently dropped connection (NAT timeout, port-forwarder idle drop) would
+/// go unnoticed on both ends for the OS defaults (typically hours). With
+/// these settings a dead peer is detected within about a minute.
+pub fn set_tcp_keepalive<S>(stream: &S) -> Result<()>
+where
+    for<'a> socket2::SockRef<'a>: From<&'a S>,
+{
+    let keepalive = socket2::TcpKeepalive::new()
+        .with_time(std::time::Duration::from_secs(30))
+        .with_interval(std::time::Duration::from_secs(10));
+    #[cfg(not(target_os = "windows"))]
+    let keepalive = keepalive.with_retries(3);
+    socket2::SockRef::from(stream).set_tcp_keepalive(&keepalive)?;
     Ok(())
 }
