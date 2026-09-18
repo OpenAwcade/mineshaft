@@ -15,6 +15,12 @@ pub enum CoreError {
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 
+    /// A received frame exceeded the maximum accepted size; the peer is most
+    /// likely not speaking this protocol (port scan, health check, browser
+    /// hitting a forwarded port) or the stream is desynchronized.
+    #[error("frame too large: {0} bytes")]
+    FrameTooLarge(usize),
+
     /// Invalid local or remote state.
     #[error("invalid state: {0}")]
     InvalidState(&'static str),

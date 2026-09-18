@@ -104,6 +104,11 @@ impl DiscoveryService {
         }
     }
 
+    /// Update an advertised host and rebuild its discovery response packet.
+    pub fn update_host(&self, sender_id: u64, data: ServerAdvertisement) {
+        self.advertise(sender_id, data);
+    }
+
     /// Remove an advertised server entry.
     pub fn unadvertise(&self, sender_id: u64) {
         self.advertised

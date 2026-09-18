@@ -7,7 +7,8 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use futures::StreamExt;
 use mineshaft_core::net::{ClientMessage, ServerMessage, read_message, write_message};
@@ -21,6 +22,12 @@ use tracing::{debug, info, warn};
 
 const DEFAULT_SERVER_ADDR: &str = "127.0.0.1:25000";
 const LOOP_INTERVAL: Duration = Duration::from_secs(2);
+/// How often we ping the rendezvous server. Keeps NAT and port-forwarder
+/// state alive on otherwise idle connections (a hosting client sends nothing
+/// else) and drives liveness detection on both ends.
+const PING_INTERVAL: Duration = Duration::from_secs(15);
+/// Reconnect when no message (e.g. a pong) has arrived for this long.
+const LIVENESS_TIMEOUT: Duration = Duration::from_secs(45);
 
 /// Resolve the rendezvous server address.
 /// Priority: `--server <addr>` flag > positional arg > `MINESHAFT_SERVER` env > default.
@@ -56,7 +63,7 @@ type SharedOptionWriter = Arc<tokio::sync::Mutex<Option<SharedWriter>>>;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::INFO)
+        .with_max_level(tracing::Level::DEBUG)
         .init();
 
     let server_addr = resolve_server_addr();
@@ -156,14 +163,53 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut server: Option<SharedWriter> = None;
     let server_incoming: SharedIncoming = Arc::new(tokio::sync::Mutex::new(None));
     let mut hosting_registered = false;
+    let mut registered_advertisement: Option<ServerAdvertisement> = None;
     let mut advertised_count = 0usize;
+    // Tracks whether the reader task of the current connection is alive; a
+    // dead reader means the connection is gone even if writes still succeed.
+    let reader_alive = Arc::new(AtomicBool::new(false));
+    // Last time any message arrived from the server; pong replies to our
+    // pings keep this fresh. A stale timestamp means the connection died
+    // silently (e.g. NAT/port-forwarder idle drop) even though the reader
+    // task is still blocked on a read.
+    let last_seen = Arc::new(std::sync::Mutex::new(Instant::now()));
+    let mut last_ping = Instant::now();
+    // Abort handle of the current connection's reader task, so a dead
+    // connection's reader does not linger after a reconnect.
+    let mut reader_task: Option<tokio::task::AbortHandle> = None;
 
     loop {
+        // The connection was dropped somewhere below: make sure the dead
+        // reader task and the shared writer are cleaned up before reconnecting.
+        if server.is_none()
+            && let Some(handle) = reader_task.take()
+        {
+            handle.abort();
+            *server_writer.lock().await = None;
+        }
+        if server.is_some() {
+            let reader_dead = !reader_alive.load(Ordering::Relaxed);
+            let silent = last_seen.lock().unwrap().elapsed() > LIVENESS_TIMEOUT;
+            if reader_dead || silent {
+                if silent && !reader_dead {
+                    warn!(
+                        "no message from rendezvous server for {:?}; reconnecting",
+                        LIVENESS_TIMEOUT
+                    );
+                } else {
+                    warn!("rendezvous connection lost; reconnecting");
+                }
+                server = None;
+                continue;
+            }
+        }
         if server.is_none() {
             match TcpStream::connect(&server_addr).await {
                 Ok(stream) => {
                     // Signaling frames are small and latency-sensitive; disable Nagle.
                     let _ = stream.set_nodelay(true);
+                    // Detect silently dropped connections even while idle.
+                    let _ = mineshaft_core::net::set_tcp_keepalive(&stream);
                     info!("connected to rendezvous server {}", server_addr);
                     let (mut read_half, write_half) = stream.into_split();
                     let write_half = Arc::new(tokio::sync::Mutex::new(write_half));
@@ -172,19 +218,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     let join_conns = join_conns.clone();
                     let local_game_id = local_game_id.clone();
                     let signaling = signaling.clone();
+                    let reader_alive = reader_alive.clone();
+                    let last_seen = last_seen.clone();
                     let (incoming_tx, incoming_rx) =
                         tokio::sync::mpsc::unbounded_channel::<ServerMessage>();
-                    tokio::spawn(async move {
+                    reader_alive.store(true, Ordering::Relaxed);
+                    *last_seen.lock().unwrap() = Instant::now();
+                    last_ping = Instant::now();
+                    let task = tokio::spawn(async move {
                         loop {
-                            match read_message::<ServerMessage, _>(&mut read_half).await {
-                                Ok(Some(msg @ ServerMessage::HostList(_))) => {
+                            let msg = match read_message::<ServerMessage, _>(&mut read_half).await {
+                                Ok(Some(msg)) => msg,
+                                Ok(None) => {
+                                    warn!("rendezvous server closed the connection");
+                                    break;
+                                }
+                                Err(e) => {
+                                    warn!("rendezvous read error: {}", e);
+                                    break;
+                                }
+                            };
+                            *last_seen.lock().unwrap() = Instant::now();
+                            match msg {
+                                msg @ ServerMessage::HostList(_) => {
                                     let _ = incoming_tx.send(msg);
                                 }
-                                Ok(Some(ServerMessage::Signal {
+                                ServerMessage::Signal {
                                     connection_id,
                                     joiner_network_id,
                                     data,
-                                })) => {
+                                } => {
                                     let kind = data.split(' ').next().unwrap_or("?");
                                     info!(
                                         "injecting {} (conn {}) from remote into local game",
@@ -200,36 +263,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                                     )
                                     .await;
                                 }
-                                Ok(Some(ServerMessage::IncomingJoin {
+                                ServerMessage::IncomingJoin {
                                     joiner_network_id,
                                     session_id,
-                                })) => {
+                                } => {
                                     info!(
                                         "joiner {:#x} signaling into our world (session {})",
                                         joiner_network_id, session_id
                                     );
                                 }
-                                Ok(Some(ServerMessage::JoinAccepted { session_id })) => {
+                                ServerMessage::JoinAccepted { session_id } => {
                                     debug!("server noted session {}", session_id);
                                 }
-                                Ok(Some(ServerMessage::Registered { sender_id })) => {
+                                ServerMessage::Registered { sender_id } => {
                                     debug!("server acked registration {:#x}", sender_id);
                                 }
-                                Ok(Some(ServerMessage::Error(e))) => warn!("server error: {}", e),
-                                Ok(None) => {
-                                    warn!("rendezvous server closed the connection");
-                                    break;
+                                ServerMessage::Pong => {
+                                    debug!("pong from rendezvous server");
                                 }
-                                Err(e) => {
-                                    warn!("rendezvous read error: {}", e);
-                                    break;
-                                }
+                                ServerMessage::Error(e) => warn!("server error: {}", e),
                             }
                         }
+                        reader_alive.store(false, Ordering::Relaxed);
                     });
+                    reader_task = Some(task.abort_handle());
 
                     server = Some(write_half);
                     *server_incoming.lock().await = Some(incoming_rx);
+                    // The server drops our host registration when the old
+                    // connection dies, so register again on the next
+                    // Hosting detection below.
+                    hosting_registered = false;
+                    registered_advertisement = None;
                 }
                 Err(e) => {
                     warn!("rendezvous connect failed: {}; retrying", e);
@@ -251,6 +316,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     )
                     .await;
                     hosting_registered = false;
+                    registered_advertisement = None;
                     *local_game_id.lock().await = None;
                 }
                 if advertised_count > 0 {
@@ -263,30 +329,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 if let Some((game_id, _)) = &world {
                     *local_game_id.lock().await = Some(*game_id);
                 }
-                if !hosting_registered {
-                    let ad = world.map(|(_, ad)| ad).unwrap_or_else(|| {
-                        warn!("hosting but probe gave no data; using defaults");
-                        let mut ad = ServerAdvertisement::default();
-                        ad.session_id = format!("{:016x}", my_network_id);
-                        ad
-                    });
+                let ad = world.map(|(_, ad)| ad).unwrap_or_else(|| {
+                    warn!("hosting but probe gave no data; using defaults");
+                    let mut ad = ServerAdvertisement::default();
+                    ad.session_id = format!("{:016x}", my_network_id);
+                    ad
+                });
+                let host_changed =
+                    !hosting_registered || registered_advertisement.as_ref() != Some(&ad);
+                if host_changed {
+                    if advertised_count > 0 {
+                        discovery.replace_all(vec![]);
+                        advertised_count = 0;
+                    }
+                    discovery.update_host(my_network_id, ad.clone());
+                    let update_kind = if hosting_registered {
+                        "updated"
+                    } else {
+                        "registering"
+                    };
                     info!(
-                        "game is hosting '{}'/'{}' ({} players, mode {}) — registering with server",
-                        ad.server_name, ad.level_name, ad.player_count, ad.game_type
+                        "game is hosting '{}'/'{}' ({} players, mode {}) — {} with server",
+                        ad.server_name, ad.level_name, ad.player_count, ad.game_type, update_kind
                     );
-                    send_or_drop(
-                        &mut server,
-                        &ClientMessage::RegisterHost(AdvertisedServer {
-                            sender_id: my_network_id,
-                            data: ad,
-                        }),
-                    )
-                    .await;
-                    hosting_registered = true;
-                }
-                if advertised_count > 0 {
-                    discovery.replace_all(vec![]);
-                    advertised_count = 0;
+                    let message = AdvertisedServer {
+                        sender_id: my_network_id,
+                        data: ad.clone(),
+                    };
+                    let client_message = if hosting_registered {
+                        ClientMessage::UpdateHost(message)
+                    } else {
+                        ClientMessage::RegisterHost(message)
+                    };
+                    send_or_drop(&mut server, &client_message).await;
+                    hosting_registered = server.is_some();
+                    registered_advertisement = hosting_registered.then_some(ad);
                 }
             }
             (GameState::Browsing, _) => {
@@ -300,6 +377,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     )
                     .await;
                     hosting_registered = false;
+                    registered_advertisement = None;
                     *local_game_id.lock().await = None;
                 }
                 debug!("user browsing; requesting host list");
@@ -313,9 +391,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         discovery.replace_all(hosts);
                         advertised_count = discovery.advertised().len();
                     }
-                    Err(e) => warn!("host list fetch failed: {}", e),
+                    Err(e) => {
+                        // A failed fetch usually means the connection is dead;
+                        // drop it so the next iteration reconnects immediately
+                        // instead of waiting for the liveness timeout.
+                        warn!("host list fetch failed: {}; reconnecting", e);
+                        server = None;
+                    }
                 }
             }
+        }
+
+        // Heartbeat: keeps the connection alive through NATs/port forwarders
+        // and lets both sides detect a dead connection even while hosting.
+        if server.is_some() && last_ping.elapsed() >= PING_INTERVAL {
+            send_or_drop(&mut server, &ClientMessage::Ping).await;
+            last_ping = Instant::now();
         }
 
         tokio::time::sleep(LOOP_INTERVAL).await;
@@ -347,8 +438,11 @@ async fn inject_signal(
     let packet = MessagePacket::new(recipient, data);
     match discovery::marshal(&packet, sender) {
         Ok(bytes) => {
-            if let Err(e) = signaling.socket().send_to(&bytes, "127.0.0.1:7551").await {
-                warn!("failed to inject signal into game: {}", e);
+            // The game may listen on IPv4 or IPv6 loopback only; hit both.
+            for target in ["127.0.0.1:7551", "[::1]:7551"] {
+                if let Err(e) = signaling.socket().send_to(&bytes, target).await {
+                    debug!("signal injection to {} failed: {}", target, e);
+                }
             }
         }
         Err(e) => warn!("failed to marshal signal: {}", e),
@@ -400,17 +494,25 @@ async fn probe_host_server_data(
 ) -> Option<(u64, ServerAdvertisement)> {
     use nethernet::protocol::packet::discovery::{self, RequestPacket};
 
+    let signaling = discovery.signaling();
+    // Only consider responses to this probe; stale entries from an earlier
+    // game instance must not be mistaken for the current world.
+    signaling.clear_discovered().await;
     let probe_id: u64 = rand::random();
     let request = discovery::marshal(&RequestPacket, probe_id).ok()?;
-    discovery
-        .signaling()
-        .socket()
-        .send_to(&request, "127.0.0.1:7551")
-        .await
-        .ok()?;
+    let socket = signaling.socket();
+    let mut sent = false;
+    for target in ["127.0.0.1:7551", "[::1]:7551"] {
+        if socket.send_to(&request, target).await.is_ok() {
+            sent = true;
+        }
+    }
+    if !sent {
+        return None;
+    }
 
     tokio::time::sleep(Duration::from_millis(250)).await;
-    let servers = discovery.signaling().discover().await;
+    let servers = signaling.discover().await;
     let (game_id, sd) = servers.iter().next()?;
     Some((
         *game_id,
@@ -448,12 +550,26 @@ async fn fetch_host_list(
     let rx = guard
         .as_mut()
         .ok_or(mineshaft_core::CoreError::InvalidState("no reader channel"))?;
-    match tokio::time::timeout(Duration::from_secs(5), rx.recv()).await {
-        Ok(Some(ServerMessage::HostList(hosts))) => Ok(hosts),
-        Ok(Some(_)) => Ok(vec![]),
-        Ok(None) => Err(mineshaft_core::CoreError::InvalidState("reader closed")),
-        Err(_) => Err(mineshaft_core::CoreError::Other(
-            "list response timeout".into(),
-        )),
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(mineshaft_core::CoreError::Other(
+                "list response timeout".into(),
+            ));
+        }
+        match tokio::time::timeout(remaining, rx.recv()).await {
+            Ok(Some(ServerMessage::HostList(hosts))) => return Ok(hosts),
+            Ok(Some(ServerMessage::Pong)) => continue,
+            Ok(Some(_)) => continue,
+            Ok(None) => {
+                return Err(mineshaft_core::CoreError::InvalidState("reader closed"));
+            }
+            Err(_) => {
+                return Err(mineshaft_core::CoreError::Other(
+                    "list response timeout".into(),
+                ));
+            }
+        }
     }
 }
