@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-nethernet = { workspace = true }
+nethernet-tokio = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 bytes = { workspace = true }

@@ -18,4 +18,4 @@ pub use discovery::{AdvertisedServer, DiscoveryService, SharedDiscoveryService};
 pub use error::{CoreError, Result};
 pub use relay::{RelayCommand, RelayService, SharedRelayService};
 pub use session::{SessionRegistry, SessionSummary};
-pub use transport::{Listener, SharedSignaling, Transport};
+pub use transport::{Accepted, Listener, Transport};

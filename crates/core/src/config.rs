@@ -29,6 +29,12 @@ pub struct ServerAdvertisement {
     pub transport_layer: u8,
     /// Connection type (4 = LAN).
     pub connection_type: u8,
+    /// Bedrock protocol version reported by the host's game (ServerData v7).
+    #[serde(default)]
+    pub protocol_version: u32,
+    /// Game version string reported by the host's game (ServerData v7).
+    #[serde(default)]
+    pub game_version: String,
 }
 
 impl Default for ServerAdvertisement {
@@ -46,6 +52,8 @@ impl Default for ServerAdvertisement {
             session_id: "0000000000000000".to_string(),
             transport_layer: 2,
             connection_type: 4,
+            protocol_version: 0,
+            game_version: String::new(),
         }
     }
 }

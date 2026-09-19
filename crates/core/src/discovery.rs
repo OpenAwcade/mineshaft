@@ -9,8 +9,9 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, RwLock};
 
-use nethernet::protocol::packet::discovery::{self, ResponsePacket, ServerData};
-use nethernet::{LanConfig, LanSignaling};
+use nethernet_tokio::protocol::NetherCodec;
+use nethernet_tokio::protocol::packet::discovery::{self, Packets, ResponsePacket, ServerData};
+use nethernet_tokio::{LanConfig, LanSignaling};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -228,10 +229,19 @@ fn build_response_packet(sender_id: u64, data: &ServerAdvertisement) -> Result<A
         session_id: data.session_id.clone(),
         transport_layer: data.transport_layer,
         connection_type: data.connection_type,
+        protocol_version: data.protocol_version,
+        game_version: data.game_version.clone(),
     };
 
-    let response = ResponsePacket::new(server_data.marshal()?);
-    Ok(discovery::marshal(&response, sender_id)?.into())
+    let mut application_data = Vec::with_capacity(server_data.size_hint());
+    server_data
+        .serialize(&mut application_data)
+        .map_err(nethernet_tokio::NetherError::from)?;
+
+    let response = ResponsePacket::new(application_data);
+    let packet = discovery::encode(&Packets::Response(response), sender_id)
+        .map_err(nethernet_tokio::NetherError::from)?;
+    Ok(packet.into())
 }
 
 impl Drop for DiscoveryService {

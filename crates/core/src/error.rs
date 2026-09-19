@@ -5,7 +5,7 @@ use thiserror::Error;
 pub enum CoreError {
     /// NetherNet transport error.
     #[error("nethernet error: {0}")]
-    Nethernet(#[from] nethernet::NethernetError),
+    Nethernet(#[from] nethernet_tokio::NetherError),
 
     /// Platform probing failed.
     #[error("platform error: {0}")]

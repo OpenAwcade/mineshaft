@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
-use nethernet::Addr;
+use nethernet_tokio::Addr;
 use tokio::sync::mpsc;
 
 use crate::config::RelayConfig;

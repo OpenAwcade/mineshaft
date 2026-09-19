@@ -15,8 +15,7 @@ use mineshaft_core::net::{ClientMessage, ServerMessage, read_message, write_mess
 use mineshaft_core::{
     AdvertisedServer, DiscoveryConfig, DiscoveryService, ServerAdvertisement, platform,
 };
-use nethernet::Signaling as _;
-use nethernet::protocol::packet::discovery::{self, MessagePacket};
+use nethernet_tokio::protocol::packet::discovery::{self, MessagePacket, Packets};
 use tokio::net::TcpStream;
 use tracing::{debug, info, warn};
 
@@ -63,7 +62,10 @@ type SharedOptionWriter = Arc<tokio::sync::Mutex<Option<SharedWriter>>>;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::DEBUG)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("debug")),
+        )
         .init();
 
     let server_addr = resolve_server_addr();
@@ -416,7 +418,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 /// Inject a remote signaling message into the local game as a discovery
 /// MessagePacket.
 async fn inject_signal(
-    signaling: &Arc<nethernet::LanSignaling>,
+    signaling: &Arc<nethernet_tokio::LanSignaling>,
     join_conns: &Arc<tokio::sync::Mutex<HashMap<u64, (u64, u64)>>>,
     local_game_id: &Arc<tokio::sync::Mutex<Option<u64>>>,
     connection_id: u64,
@@ -436,7 +438,7 @@ async fn inject_signal(
     };
 
     let packet = MessagePacket::new(recipient, data);
-    match discovery::marshal(&packet, sender) {
+    match discovery::encode(&Packets::Message(packet), sender) {
         Ok(bytes) => {
             // The game may listen on IPv4 or IPv6 loopback only; hit both.
             for target in ["127.0.0.1:7551", "[::1]:7551"] {
@@ -492,14 +494,14 @@ async fn detect_game_state(
 async fn probe_host_server_data(
     discovery: &Arc<DiscoveryService>,
 ) -> Option<(u64, ServerAdvertisement)> {
-    use nethernet::protocol::packet::discovery::{self, RequestPacket};
+    use nethernet_tokio::protocol::packet::discovery::{RequestPacket, encode};
 
     let signaling = discovery.signaling();
     // Only consider responses to this probe; stale entries from an earlier
     // game instance must not be mistaken for the current world.
     signaling.clear_discovered().await;
     let probe_id: u64 = rand::random();
-    let request = discovery::marshal(&RequestPacket, probe_id).ok()?;
+    let request = encode(&Packets::Request(RequestPacket), probe_id).ok()?;
     let socket = signaling.socket();
     let mut sent = false;
     for target in ["127.0.0.1:7551", "[::1]:7551"] {
@@ -529,6 +531,8 @@ async fn probe_host_server_data(
             session_id: sd.session_id.clone(),
             transport_layer: sd.transport_layer,
             connection_type: sd.connection_type,
+            protocol_version: sd.protocol_version,
+            game_version: sd.game_version.clone(),
         },
     ))
 }
