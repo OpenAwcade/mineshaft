@@ -1,9 +1,9 @@
 //! Relay registry: which local node hosts which advertised server, and which
 //! remote node wants which session.
 
-use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
+use dashmap::DashMap;
 use nethernet_tokio::Addr;
 use tokio::sync::mpsc;
 
@@ -13,6 +13,12 @@ use crate::error::{CoreError, Result};
 
 /// Shared handle to the relay service.
 pub type SharedRelayService = Arc<RelayService>;
+
+/// Maximum queued commands before submissions start being rejected. Commands
+/// are tiny registry operations; a full queue means the owner loop is wedged
+/// and backpressure (an error to the caller) is the right answer, not an
+/// ever-growing buffer.
+const COMMAND_QUEUE_CAPACITY: usize = 256;
 
 /// Commands the relay can consume from signaling/transport layers.
 #[derive(Debug)]
@@ -33,28 +39,32 @@ pub enum RelayCommand {
 /// Relay service owning the host registry and relay bookkeeping.
 pub struct RelayService {
     config: RelayConfig,
-    hosts: RwLock<HashMap<u64, AdvertisedServer>>,
-    command_tx: mpsc::UnboundedSender<RelayCommand>,
-    command_rx: tokio::sync::Mutex<mpsc::UnboundedReceiver<RelayCommand>>,
+    hosts: DashMap<u64, AdvertisedServer>,
+    command_tx: mpsc::Sender<RelayCommand>,
+    command_rx: tokio::sync::Mutex<mpsc::Receiver<RelayCommand>>,
 }
 
 impl RelayService {
     /// Create a new relay service.
     pub fn new(config: RelayConfig) -> SharedRelayService {
-        let (command_tx, command_rx) = mpsc::unbounded_channel();
+        let (command_tx, command_rx) = mpsc::channel(COMMAND_QUEUE_CAPACITY);
         Arc::new(Self {
             config,
-            hosts: RwLock::new(HashMap::new()),
+            hosts: DashMap::new(),
             command_tx,
             command_rx: tokio::sync::Mutex::new(command_rx),
         })
     }
 
     /// Submit a relay command for processing by the owner task.
+    ///
+    /// Fails immediately when the queue is full instead of buffering without
+    /// bound: a wedged owner loop must surface as an error, not as memory
+    /// growth.
     pub fn submit(&self, command: RelayCommand) -> Result<()> {
         self.command_tx
-            .send(command)
-            .map_err(|_| CoreError::InvalidState("relay command channel closed"))
+            .try_send(command)
+            .map_err(|_| CoreError::InvalidState("relay command queue full or closed"))
     }
 
     /// Process pending commands once. Intended to be called from a single
@@ -82,32 +92,25 @@ impl RelayService {
 
     /// Register or replace an advertised host.
     pub fn register_host(&self, server: AdvertisedServer) {
-        let mut hosts = self.hosts.write().expect("relay hosts poisoned");
-        if hosts.len() >= self.config.max_advertised_hosts && !hosts.contains_key(&server.sender_id)
+        if self.hosts.len() >= self.config.max_advertised_hosts
+            && !self.hosts.contains_key(&server.sender_id)
+            && let Some(oldest) = self.hosts.iter().next().map(|entry| *entry.key())
         {
-            if let Some(oldest) = hosts.keys().next().copied() {
-                hosts.remove(&oldest);
-            }
+            self.hosts.remove(&oldest);
         }
-        hosts.insert(server.sender_id, server);
+        self.hosts.insert(server.sender_id, server);
     }
 
     /// Snapshot all currently advertised hosts.
     pub fn host_list(&self) -> Vec<AdvertisedServer> {
         self.hosts
-            .read()
-            .expect("relay hosts poisoned")
-            .values()
-            .cloned()
+            .iter()
+            .map(|entry| entry.value().clone())
             .collect()
     }
 
     /// Look up a host by its advertised sender ID.
     pub fn host_by_sender(&self, sender_id: u64) -> Option<AdvertisedServer> {
-        self.hosts
-            .read()
-            .expect("relay hosts poisoned")
-            .get(&sender_id)
-            .cloned()
+        self.hosts.get(&sender_id).map(|entry| entry.clone())
     }
 }

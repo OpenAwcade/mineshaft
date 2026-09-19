@@ -5,11 +5,11 @@
 //! (CONNECTREQUEST/CONNECTRESPONSE/CANDIDATEADD) between the local game and
 //! the remote host over the rendezvous server.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+use dashmap::DashMap;
 use futures::StreamExt;
 use mineshaft_core::net::{ClientMessage, ServerMessage, read_message, write_message};
 use mineshaft_core::{
@@ -27,6 +27,16 @@ const LOOP_INTERVAL: Duration = Duration::from_secs(2);
 const PING_INTERVAL: Duration = Duration::from_secs(15);
 /// Reconnect when no message (e.g. a pong) has arrived for this long.
 const LIVENESS_TIMEOUT: Duration = Duration::from_secs(45);
+
+/// Maximum remembered join connections. Entries are inserted when the local
+/// game sends an offer and live for the rest of the process; a game that
+/// hammers offers would otherwise grow this map forever.
+const MAX_JOIN_CONNS: usize = 1024;
+
+/// Buffer between the connection reader task and the main loop. Only
+/// `HostList` responses flow through here; a full buffer means the main loop
+/// is stuck, so the reader drops extras instead of accumulating them.
+const INCOMING_QUEUE_CAPACITY: usize = 16;
 
 /// Resolve the rendezvous server address.
 /// Priority: `--server <addr>` flag > positional arg > `MINESHAFT_SERVER` env > default.
@@ -59,7 +69,10 @@ enum GameState {
 type SharedWriter = Arc<tokio::sync::Mutex<tokio::net::tcp::OwnedWriteHalf>>;
 type SharedOptionWriter = Arc<tokio::sync::Mutex<Option<SharedWriter>>>;
 
-#[tokio::main]
+// The workload is timers plus small UDP/TCP messages; a single-threaded
+// runtime avoids paying for one worker-thread stack per CPU core, which
+// matters for a process that runs 24/7 next to the game.
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -83,8 +96,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     // connection_id -> (game network id, advertised target id) for joiner-side
     // response injection
-    let join_conns: Arc<tokio::sync::Mutex<HashMap<u64, (u64, u64)>>> =
-        Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let join_conns: Arc<DashMap<u64, (u64, u64)>> = Arc::new(DashMap::new());
     // network id of our locally hosted game (hosting mode)
     let local_game_id: Arc<tokio::sync::Mutex<Option<u64>>> =
         Arc::new(tokio::sync::Mutex::new(None));
@@ -128,7 +140,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
                 let target_id = if let Some(t) = target {
                     // joiner side: remember who the game clicked + the game's id
-                    join_conns.lock().await.insert(conn, (sender, t));
+                    if join_conns.len() >= MAX_JOIN_CONNS {
+                        warn!("join connection map full; dropping oldest entry");
+                        if let Some(oldest) = join_conns.iter().next().map(|e| *e.key()) {
+                            join_conns.remove(&oldest);
+                        }
+                    }
+                    join_conns.insert(conn, (sender, t));
                     t
                 } else {
                     // host side: local game answering; server routes by conn id
@@ -223,7 +241,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     let reader_alive = reader_alive.clone();
                     let last_seen = last_seen.clone();
                     let (incoming_tx, incoming_rx) =
-                        tokio::sync::mpsc::unbounded_channel::<ServerMessage>();
+                        tokio::sync::mpsc::channel::<ServerMessage>(INCOMING_QUEUE_CAPACITY);
                     reader_alive.store(true, Ordering::Relaxed);
                     *last_seen.lock().unwrap() = Instant::now();
                     last_ping = Instant::now();
@@ -243,7 +261,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                             *last_seen.lock().unwrap() = Instant::now();
                             match msg {
                                 msg @ ServerMessage::HostList(_) => {
-                                    let _ = incoming_tx.send(msg);
+                                    // Main loop is the only consumer; if it is
+                                    // stuck the extra responses are worthless.
+                                    let _ = incoming_tx.try_send(msg);
                                 }
                                 ServerMessage::Signal {
                                     connection_id,
@@ -419,7 +439,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 /// MessagePacket.
 async fn inject_signal(
     signaling: &Arc<nethernet_tokio::LanSignaling>,
-    join_conns: &Arc<tokio::sync::Mutex<HashMap<u64, (u64, u64)>>>,
+    join_conns: &Arc<DashMap<u64, (u64, u64)>>,
     local_game_id: &Arc<tokio::sync::Mutex<Option<u64>>>,
     connection_id: u64,
     joiner_network_id: u64,
@@ -429,7 +449,7 @@ async fn inject_signal(
     let (sender, recipient) = if let Some(game_id) = *local_game_id.lock().await {
         // we are hosting: present the joiner as the sender, our game receives
         (joiner_network_id, game_id)
-    } else if let Some((game_id, target)) = join_conns.lock().await.get(&connection_id).copied() {
+    } else if let Some((game_id, target)) = join_conns.get(&connection_id).map(|e| *e) {
         // we are joining: present the advertised server as the sender
         (target, game_id)
     } else {
@@ -469,7 +489,7 @@ async fn send_to_local_game(socket: &tokio::net::UdpSocket, bytes: &[u8]) -> boo
 }
 
 type SharedIncoming =
-    Arc<tokio::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<ServerMessage>>>>;
+    Arc<tokio::sync::Mutex<Option<tokio::sync::mpsc::Receiver<ServerMessage>>>>;
 
 /// Send a message over the persistent connection; drop it on failure so the
 /// next loop iteration reconnects.

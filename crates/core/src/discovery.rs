@@ -5,10 +5,10 @@
 //! response packets from an ephemeral socket directly to the game's client
 //! socket (`127.0.0.1:7551`, `[::1]:7551`, etc.) at a steady heartbeat.
 
-use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
+use dashmap::DashMap;
 use nethernet_tokio::protocol::NetherCodec;
 use nethernet_tokio::protocol::packet::discovery::{self, Packets, ResponsePacket, ServerData};
 use nethernet_tokio::{LanConfig, LanSignaling};
@@ -34,7 +34,7 @@ pub type SharedDiscoveryService = Arc<DiscoveryService>;
 /// lifecycle for negotiation.
 pub struct DiscoveryService {
     config: DiscoveryConfig,
-    advertised: RwLock<HashMap<u64, CachedAdvertisement>>,
+    advertised: DashMap<u64, CachedAdvertisement>,
     signaling: Arc<LanSignaling>,
     cancel: CancellationToken,
     task: tokio::sync::Mutex<Option<JoinHandle<()>>>,
@@ -78,7 +78,7 @@ impl DiscoveryService {
         let signaling = Arc::new(signaling);
         Ok(Arc::new(Self {
             config,
-            advertised: RwLock::new(HashMap::new()),
+            advertised: DashMap::new(),
             signaling,
             cancel: CancellationToken::new(),
             task: tokio::sync::Mutex::new(None),
@@ -95,8 +95,6 @@ impl DiscoveryService {
         match build_response_packet(sender_id, &data) {
             Ok(packet) => {
                 self.advertised
-                    .write()
-                    .expect("advertised registry poisoned")
                     .insert(sender_id, CachedAdvertisement { data, packet });
             }
             Err(e) => {
@@ -112,30 +110,24 @@ impl DiscoveryService {
 
     /// Remove an advertised server entry.
     pub fn unadvertise(&self, sender_id: u64) {
-        self.advertised
-            .write()
-            .expect("advertised registry poisoned")
-            .remove(&sender_id);
+        self.advertised.remove(&sender_id);
     }
 
     /// Replace the advertised set atomically.
     pub fn replace_all(&self, entries: Vec<AdvertisedServer>) {
-        let mut guard = self
-            .advertised
-            .write()
-            .expect("advertised registry poisoned");
         // Drop entries that are no longer advertised
-        guard.retain(|sender_id, _| entries.iter().any(|e| e.sender_id == *sender_id));
+        self.advertised
+            .retain(|sender_id, _| entries.iter().any(|e| e.sender_id == *sender_id));
         for entry in entries {
             // Skip re-marshaling when the advertisement has not changed
-            if let Some(existing) = guard.get(&entry.sender_id)
+            if let Some(existing) = self.advertised.get(&entry.sender_id)
                 && existing.data == entry.data
             {
                 continue;
             }
             match build_response_packet(entry.sender_id, &entry.data) {
                 Ok(packet) => {
-                    guard.insert(
+                    self.advertised.insert(
                         entry.sender_id,
                         CachedAdvertisement {
                             data: entry.data,
@@ -153,12 +145,10 @@ impl DiscoveryService {
     /// Snapshot currently advertised entries.
     pub fn advertised(&self) -> Vec<AdvertisedServer> {
         self.advertised
-            .read()
-            .expect("advertised registry poisoned")
             .iter()
-            .map(|(sender_id, data)| AdvertisedServer {
-                sender_id: *sender_id,
-                data: data.data.clone(),
+            .map(|entry| AdvertisedServer {
+                sender_id: *entry.key(),
+                data: entry.value().data.clone(),
             })
             .collect()
     }
@@ -199,10 +189,8 @@ impl DiscoveryService {
     async fn broadcast_once(&self, targets: &[SocketAddr]) {
         let packets: Vec<Arc<[u8]>> = self
             .advertised
-            .read()
-            .expect("advertised registry poisoned")
-            .values()
-            .map(|entry| entry.packet.clone())
+            .iter()
+            .map(|entry| entry.value().packet.clone())
             .collect();
         let socket = self.signaling.socket();
         // A socket can only address its own family (the default 0.0.0.0 bind

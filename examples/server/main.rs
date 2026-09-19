@@ -3,17 +3,18 @@
 //! Keeps the registry of hosting clients, hands the host list to browsing
 //! clients, and relays join requests from joiners to hosts.
 
-use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use dashmap::DashMap;
 use mineshaft_core::CoreError;
 use mineshaft_core::net::{
     ClientMessage, ServerMessage, read_message, set_tcp_keepalive, write_message,
 };
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 /// Default listen address for the rendezvous server.
@@ -26,26 +27,39 @@ const BIND_ADDR: &str = "0.0.0.0:25000";
 /// port-forwarder idle drop that never delivered a FIN/RST).
 const CLIENT_IDLE_TIMEOUT: Duration = Duration::from_secs(45);
 
+/// Maximum queued outbound messages per client. Signaling frames are small
+/// and flow at human pace; a full queue means the client has stopped reading
+/// (dead TCP connection), so further sends are dropped rather than buffered
+/// without bound on this 24/7 process.
+const CLIENT_QUEUE_CAPACITY: usize = 64;
+
+/// Maximum relay sessions remembered at once. Session keys are
+/// client-controlled (`connection_id` in `Signal`), so without a cap a
+/// misbehaving client could grow the map forever.
+const MAX_SESSIONS: usize = 4096;
+
 /// A connected client with an optional registered host entry.
 struct ClientHandle {
-    tx: mpsc::UnboundedSender<ServerMessage>,
+    tx: mpsc::Sender<ServerMessage>,
 }
 
 #[derive(Default)]
 struct Registry {
     /// All connected clients by socket address.
-    clients: HashMap<SocketAddr, ClientHandle>,
+    clients: DashMap<SocketAddr, ClientHandle>,
     /// sender_id -> addr of the client hosting it.
-    hosts: HashMap<u64, SocketAddr>,
+    hosts: DashMap<u64, SocketAddr>,
     /// sender_id -> full advertised record (for serving HostList).
-    host_records: HashMap<u64, mineshaft_core::AdvertisedServer>,
+    host_records: DashMap<u64, mineshaft_core::AdvertisedServer>,
     /// session_id -> (joiner addr, host addr) relay pairing.
-    sessions: HashMap<u64, (SocketAddr, SocketAddr)>,
+    sessions: DashMap<u64, (SocketAddr, SocketAddr)>,
     /// next relay session id
-    next_session_id: u64,
+    next_session_id: AtomicU64,
 }
 
-#[tokio::main]
+// The workload is timers plus small JSON frames over TCP; a single-threaded
+// runtime avoids paying for one worker-thread stack per CPU core.
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     tracing_subscriber::fmt()
         .with_max_level(tracing::Level::DEBUG)
@@ -57,12 +71,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let listener = TcpListener::bind(&bind).await?;
     info!("rendezvous server listening on {}", bind);
 
-    let registry = Arc::new(Mutex::new(Registry::default()));
-
-    {
-        let mut reg = registry.lock().await;
-        reg.next_session_id = 1;
-    }
+    let registry = Arc::new(Registry {
+        next_session_id: AtomicU64::new(1),
+        ..Registry::default()
+    });
 
     loop {
         let (stream, addr) = listener.accept().await?;
@@ -83,20 +95,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     other => warn!("client {} error: {}", addr, other),
                 }
             }
-            let mut reg = registry.lock().await;
-            reg.clients.remove(&addr);
+            registry.clients.remove(&addr);
             // Relay sessions involving this client are dead too.
-            reg.sessions
+            registry
+                .sessions
                 .retain(|_, (joiner, host)| *joiner != addr && *host != addr);
-            let orphaned: Vec<u64> = reg
+            let orphaned: Vec<u64> = registry
                 .hosts
                 .iter()
-                .filter(|(_, a)| **a == addr)
-                .map(|(id, _)| *id)
+                .filter(|entry| *entry.value() == addr)
+                .map(|entry| *entry.key())
                 .collect();
             for id in orphaned {
-                reg.hosts.remove(&id);
-                reg.host_records.remove(&id);
+                registry.hosts.remove(&id);
+                registry.host_records.remove(&id);
                 info!("host {:#x} unregistered (client {} left)", id, addr);
             }
             info!("client disconnected: {}", addr);
@@ -107,14 +119,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 async fn handle_client(
     stream: TcpStream,
     addr: SocketAddr,
-    registry: Arc<Mutex<Registry>>,
+    registry: Arc<Registry>,
 ) -> mineshaft_core::Result<()> {
-    let (tx, mut rx) = mpsc::unbounded_channel::<ServerMessage>();
-    registry
-        .lock()
-        .await
-        .clients
-        .insert(addr, ClientHandle { tx });
+    let (tx, mut rx) = mpsc::channel::<ServerMessage>(CLIENT_QUEUE_CAPACITY);
+    registry.clients.insert(addr, ClientHandle { tx });
 
     let (mut read_half, mut write_half) = stream.into_split();
     // If the writer dies the connection is unusable: wake the read loop so
@@ -157,37 +165,31 @@ async fn handle_client(
 
         match msg {
             ClientMessage::Ping => {
-                send_to(&registry, addr, ServerMessage::Pong).await;
+                send_to(&registry, addr, ServerMessage::Pong);
             }
             ClientMessage::RegisterHost(server) => {
                 info!(
                     "client {} registered host '{}'/'{}' ({:#x})",
                     addr, server.data.server_name, server.data.level_name, server.sender_id
                 );
-                {
-                    let mut reg = registry.lock().await;
-                    reg.hosts.insert(server.sender_id, addr);
-                    reg.host_records.insert(server.sender_id, server.clone());
-                }
+                registry.hosts.insert(server.sender_id, addr);
+                registry.host_records.insert(server.sender_id, server.clone());
                 send_to(
                     &registry,
                     addr,
                     ServerMessage::Registered {
                         sender_id: server.sender_id,
                     },
-                )
-                .await;
+                );
             }
             ClientMessage::UpdateHost(server) => {
-                let updated = {
-                    let mut reg = registry.lock().await;
-                    if reg.hosts.get(&server.sender_id).copied() == Some(addr) {
-                        reg.host_records.insert(server.sender_id, server.clone());
+                let updated =
+                    if registry.hosts.get(&server.sender_id).as_deref() == Some(&addr) {
+                        registry.host_records.insert(server.sender_id, server.clone());
                         true
                     } else {
                         false
-                    }
-                };
+                    };
                 if updated {
                     info!(
                         "client {} updated host '{}'/'{}' ({} players, {:#x})",
@@ -206,43 +208,35 @@ async fn handle_client(
             }
             ClientMessage::UnregisterHost { sender_id } => {
                 info!("client {} unregistered host {:#x}", addr, sender_id);
-                {
-                    let mut reg = registry.lock().await;
-                    if reg.hosts.get(&sender_id).copied() == Some(addr) {
-                        reg.hosts.remove(&sender_id);
-                        reg.host_records.remove(&sender_id);
-                    }
+                if registry.hosts.get(&sender_id).as_deref() == Some(&addr) {
+                    registry.hosts.remove(&sender_id);
+                    registry.host_records.remove(&sender_id);
                 }
             }
             ClientMessage::ListHosts => {
                 let hosts: Vec<mineshaft_core::AdvertisedServer> = registry
-                    .lock()
-                    .await
                     .host_records
-                    .values()
-                    .cloned()
+                    .iter()
+                    .map(|entry| entry.value().clone())
                     .collect();
                 info!(
                     "client {} requested host list ({} entries)",
                     addr,
                     hosts.len()
                 );
-                send_to(&registry, addr, ServerMessage::HostList(hosts)).await;
+                send_to(&registry, addr, ServerMessage::HostList(hosts));
             }
             ClientMessage::ConnectRequest {
                 target_sender_id,
                 joiner_network_id,
             } => {
-                let host_addr = registry.lock().await.hosts.get(&target_sender_id).copied();
+                let host_addr = registry.hosts.get(&target_sender_id).map(|r| *r);
                 match host_addr {
                     Some(host_addr) => {
-                        let session_id = {
-                            let mut reg = registry.lock().await;
-                            let id = reg.next_session_id;
-                            reg.next_session_id += 1;
-                            reg.sessions.insert(id, (addr, host_addr));
-                            id
-                        };
+                        let session_id = registry.next_session_id.fetch_add(1, Ordering::Relaxed);
+                        if registry.sessions.len() < MAX_SESSIONS {
+                            registry.sessions.insert(session_id, (addr, host_addr));
+                        }
                         info!(
                             "client {} wants to join {:#x} -> session {} (host {})",
                             addr, target_sender_id, session_id, host_addr
@@ -254,9 +248,8 @@ async fn handle_client(
                                 joiner_network_id,
                                 session_id,
                             },
-                        )
-                        .await;
-                        send_to(&registry, addr, ServerMessage::JoinAccepted { session_id }).await;
+                        );
+                        send_to(&registry, addr, ServerMessage::JoinAccepted { session_id });
                     }
                     None => {
                         warn!(
@@ -267,8 +260,7 @@ async fn handle_client(
                             &registry,
                             addr,
                             ServerMessage::Error(format!("no such host: {:#x}", target_sender_id)),
-                        )
-                        .await;
+                        );
                     }
                 }
             }
@@ -282,11 +274,14 @@ async fn handle_client(
                 // joiner -> host: target_sender_id identifies the host
                 // host -> joiner: target_sender_id == 0, route via session map
                 let dest = {
-                    let mut reg = registry.lock().await;
                     if target_sender_id != 0 {
-                        let host = reg.hosts.get(&target_sender_id).copied();
+                        let host = registry.hosts.get(&target_sender_id).map(|r| *r);
                         if let Some(host) = host {
-                            reg.sessions.insert(connection_id, (addr, host));
+                            if registry.sessions.len() < MAX_SESSIONS
+                                || registry.sessions.contains_key(&connection_id)
+                            {
+                                registry.sessions.insert(connection_id, (addr, host));
+                            }
                             info!(
                                 "signal {} conn {} from {} -> host {} (target {:#x})",
                                 kind, connection_id, addr, host, target_sender_id
@@ -294,7 +289,7 @@ async fn handle_client(
                         }
                         host
                     } else {
-                        let joiner = reg.sessions.get(&connection_id).map(|(j, _)| *j);
+                        let joiner = registry.sessions.get(&connection_id).map(|r| r.0);
                         if let Some(j) = joiner {
                             debug!(
                                 "signal {} conn {} from host -> joiner {}",
@@ -314,8 +309,7 @@ async fn handle_client(
                                 joiner_network_id,
                                 data,
                             },
-                        )
-                        .await;
+                        );
                     }
                     None => warn!("no route for signal conn {} from {}", connection_id, addr),
                 }
@@ -327,8 +321,13 @@ async fn handle_client(
     Ok(())
 }
 
-async fn send_to(registry: &Arc<Mutex<Registry>>, addr: SocketAddr, msg: ServerMessage) {
-    if let Some(client) = registry.lock().await.clients.get(&addr) {
-        let _ = client.tx.send(msg);
+/// Queue a message for a client. When the client's queue is full the client
+/// has stopped reading (dead connection that the idle timeout will reap), so
+/// the message is dropped instead of growing memory without bound.
+fn send_to(registry: &Arc<Registry>, addr: SocketAddr, msg: ServerMessage) {
+    if let Some(client) = registry.clients.get(&addr)
+        && client.tx.try_send(msg).is_err()
+    {
+        warn!("client {} outbound queue full; dropping message", addr);
     }
 }

@@ -1,6 +1,4 @@
-use std::collections::HashMap;
-use std::sync::RwLock;
-
+use dashmap::DashMap;
 use nethernet_tokio::{Addr, Session};
 
 /// Compact view of a live session tracked by the registry.
@@ -22,43 +20,34 @@ pub struct SessionSummary {
 /// stores it directly instead of behind an `Arc`.
 #[derive(Default)]
 pub struct SessionRegistry {
-    sessions: RwLock<HashMap<(String, u64), Session>>,
+    sessions: DashMap<(String, u64), Session>,
 }
 
 impl SessionRegistry {
     /// Insert or replace a session for the given key.
     pub fn upsert(&self, network_id: String, connection_id: u64, session: Session) {
-        self.sessions
-            .write()
-            .expect("session registry poisoned")
-            .insert((network_id, connection_id), session);
+        self.sessions.insert((network_id, connection_id), session);
     }
 
     /// Remove a session by key.
     pub fn remove(&self, network_id: &str, connection_id: u64) {
         self.sessions
-            .write()
-            .expect("session registry poisoned")
             .remove(&(network_id.to_string(), connection_id));
     }
 
     /// Get a session by key.
     pub fn get(&self, network_id: &str, connection_id: u64) -> Option<Session> {
         self.sessions
-            .read()
-            .expect("session registry poisoned")
             .get(&(network_id.to_string(), connection_id))
-            .cloned()
+            .map(|entry| entry.clone())
     }
 
     /// Snapshot all tracked sessions.
     pub async fn snapshot(&self) -> Vec<SessionSummary> {
         let entries: Vec<((String, u64), Session)> = self
             .sessions
-            .read()
-            .expect("session registry poisoned")
             .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
+            .map(|entry| (entry.key().clone(), entry.value().clone()))
             .collect();
 
         let mut out = Vec::with_capacity(entries.len());
@@ -75,9 +64,6 @@ impl SessionRegistry {
 
     /// Number of tracked sessions.
     pub fn len(&self) -> usize {
-        self.sessions
-            .read()
-            .expect("session registry poisoned")
-            .len()
+        self.sessions.len()
     }
 }
