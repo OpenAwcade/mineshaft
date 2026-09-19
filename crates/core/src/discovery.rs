@@ -205,8 +205,12 @@ impl DiscoveryService {
             .map(|entry| entry.packet.clone())
             .collect();
         let socket = self.signaling.socket();
+        // A socket can only address its own family (the default 0.0.0.0 bind
+        // can never reach [::1]), so skip cross-family targets rather than
+        // logging a guaranteed failure every heartbeat.
+        let v6 = socket.local_addr().map(|a| a.is_ipv6()).unwrap_or(false);
         for packet in packets {
-            for target in targets {
+            for target in targets.iter().filter(|t| t.is_ipv6() == v6) {
                 if let Err(e) = socket.send_to(&packet, target).await {
                     tracing::trace!("advertisement send to {} failed: {}", target, e);
                 }

@@ -50,16 +50,11 @@ pub fn ensure_loopback_exempt() -> Result<()> {
 #[cfg(windows)]
 mod imp {
     use super::*;
-    use std::mem::size_of;
     use std::net::UdpSocket;
     use std::process::Command;
-    use windows::Win32::Foundation::{CloseHandle, ERROR_INSUFFICIENT_BUFFER};
+    use windows::Win32::Foundation::ERROR_INSUFFICIENT_BUFFER;
     use windows::Win32::NetworkManagement::IpHelper::{
         GetExtendedUdpTable, MIB_UDPTABLE_OWNER_PID, UDP_TABLE_OWNER_PID,
-    };
-    use windows::Win32::System::Diagnostics::ToolHelp::{
-        CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
-        TH32CS_SNAPPROCESS,
     };
 
     pub fn udp_port_bound_impl(port: u16) -> Result<bool> {

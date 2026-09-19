@@ -440,15 +440,32 @@ async fn inject_signal(
     let packet = MessagePacket::new(recipient, data);
     match discovery::encode(&Packets::Message(packet), sender) {
         Ok(bytes) => {
-            // The game may listen on IPv4 or IPv6 loopback only; hit both.
-            for target in ["127.0.0.1:7551", "[::1]:7551"] {
-                if let Err(e) = signaling.socket().send_to(&bytes, target).await {
-                    debug!("signal injection to {} failed: {}", target, e);
-                }
+            if !send_to_local_game(&signaling.socket(), &bytes).await {
+                warn!("signal injection reached no local game socket");
             }
         }
         Err(e) => warn!("failed to marshal signal: {}", e),
     }
+}
+
+/// Sends `bytes` to the local game's discovery port on the loopback family
+/// the socket supports. A socket can only address its own family: the
+/// default `0.0.0.0` bind can never reach `[::1]` (EAFNOSUPPORT), so the
+/// cross-family target is skipped rather than logged as a failure.
+/// Returns true if at least one datagram was handed to the OS.
+async fn send_to_local_game(socket: &tokio::net::UdpSocket, bytes: &[u8]) -> bool {
+    let targets: &[&str] = match socket.local_addr() {
+        Ok(addr) if addr.is_ipv6() => &["[::1]:7551"],
+        _ => &["127.0.0.1:7551"],
+    };
+    let mut sent = false;
+    for target in targets {
+        match socket.send_to(bytes, target).await {
+            Ok(_) => sent = true,
+            Err(e) => debug!("local game send to {} failed: {}", target, e),
+        }
+    }
+    sent
 }
 
 type SharedIncoming =
@@ -502,14 +519,7 @@ async fn probe_host_server_data(
     signaling.clear_discovered().await;
     let probe_id: u64 = rand::random();
     let request = encode(&Packets::Request(RequestPacket), probe_id).ok()?;
-    let socket = signaling.socket();
-    let mut sent = false;
-    for target in ["127.0.0.1:7551", "[::1]:7551"] {
-        if socket.send_to(&request, target).await.is_ok() {
-            sent = true;
-        }
-    }
-    if !sent {
+    if !send_to_local_game(&signaling.socket(), &request).await {
         return None;
     }
 
