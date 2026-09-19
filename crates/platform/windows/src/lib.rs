@@ -36,11 +36,6 @@ pub fn owner_pid_of_port(port: u16) -> Result<Option<u32>> {
     owner_pid_of_port_impl(port)
 }
 
-/// Best-effort check whether Minecraft Bedrock is running.
-pub fn minecraft_process_running() -> bool {
-    minecraft_process_running_impl()
-}
-
 /// Creates a UDP socket suitable for NetherNet discovery/signaling.
 pub fn create_udp_socket(addr: SocketAddr) -> Result<std::net::UdpSocket> {
     create_udp_socket_impl(addr)
@@ -114,43 +109,6 @@ mod imp {
         }
     }
 
-    pub fn minecraft_process_running_impl() -> bool {
-        unsafe {
-            let snapshot = match CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) {
-                Ok(snapshot) => snapshot,
-                Err(_) => return false,
-            };
-
-            let mut entry = PROCESSENTRY32W {
-                dwSize: size_of::<PROCESSENTRY32W>() as u32,
-                ..Default::default()
-            };
-
-            let mut found = false;
-            if Process32FirstW(snapshot, &mut entry).is_ok() {
-                loop {
-                    let len = entry
-                        .szExeFile
-                        .iter()
-                        .position(|c| *c == 0)
-                        .unwrap_or(entry.szExeFile.len());
-                    let name = String::from_utf16_lossy(&entry.szExeFile[..len]);
-                    if name.eq_ignore_ascii_case("Minecraft.Windows.exe") {
-                        found = true;
-                        break;
-                    }
-
-                    if Process32NextW(snapshot, &mut entry).is_err() {
-                        break;
-                    }
-                }
-            }
-
-            let _ = CloseHandle(snapshot);
-            found
-        }
-    }
-
     pub fn create_udp_socket_impl(addr: SocketAddr) -> Result<UdpSocket> {
         let socket = socket2::Socket::new(
             socket2::Domain::for_address(addr),
@@ -200,10 +158,6 @@ mod imp {
         Err(PlatformError::Unsupported)
     }
 
-    pub fn minecraft_process_running_impl() -> bool {
-        false
-    }
-
     pub fn create_udp_socket_impl(addr: SocketAddr) -> Result<UdpSocket> {
         let socket = socket2::Socket::new(
             socket2::Domain::for_address(addr),
@@ -223,18 +177,3 @@ mod imp {
 
 #[cfg(not(windows))]
 use imp::*;
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[cfg(not(windows))]
-    #[test]
-    fn non_windows_stub_reports_unsupported() {
-        assert!(matches!(
-            udp_port_bound(7551),
-            Err(PlatformError::Unsupported)
-        ));
-        assert!(!minecraft_process_running());
-    }
-}

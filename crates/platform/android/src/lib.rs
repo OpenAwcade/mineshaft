@@ -45,28 +45,6 @@ pub fn udp_port_bound(port: u16) -> Result<bool> {
     Ok(false)
 }
 
-/// Best-effort check whether a Bedrock-compatible Minecraft process is running.
-///
-/// Returns `true` when a matching process is found *or* when process
-/// enumeration is unavailable/restricted; that failure mode is deliberately
-/// biased toward "running" so the transport yields more often instead of
-/// squatting on the discovery port.
-pub fn minecraft_process_running() -> bool {
-    const NAMES: &[&str] = &[
-        "Minecraft.Windows.exe",
-        "minecraft",
-        "mcpelauncher",
-        "minecraftlinux",
-        "bedrock_server",
-        "bedrock-server",
-    ];
-
-    match proc_visible_matches(NAMES) {
-        Some(found) => found,
-        None => true,
-    }
-}
-
 /// Creates a UDP socket suitable for NetherNet discovery/signaling.
 ///
 /// The socket is configured with `SO_REUSEADDR` and broadcast enabled. Some
@@ -134,45 +112,6 @@ fn table_has_port(path: &Path, needle: &str) -> Result<bool> {
     }
 
     Ok(false)
-}
-
-fn proc_visible_matches(names: &[&str]) -> Option<bool> {
-    let entries = fs::read_dir("/proc").ok()?;
-    let mut any_visible = false;
-
-    for entry in entries.flatten() {
-        let file_name = entry.file_name();
-        let Some(name) = file_name.to_str() else {
-            continue;
-        };
-        if !name.bytes().all(|b| b.is_ascii_digit()) {
-            continue;
-        }
-
-        any_visible = true;
-        let comm_path = entry.path().join("comm");
-        if let Ok(comm) = fs::read_to_string(&comm_path) {
-            let comm = comm.trim();
-            if names.iter().any(|candidate| comm == *candidate) {
-                return Some(true);
-            }
-        }
-
-        let cmdline_path = entry.path().join("cmdline");
-        if let Ok(cmdline) = fs::read(&cmdline_path) {
-            let haystack = String::from_utf8_lossy(&cmdline)
-                .replace('\0', " ")
-                .to_lowercase();
-            if names
-                .iter()
-                .any(|candidate| haystack.contains(&candidate.to_lowercase()))
-            {
-                return Some(true);
-            }
-        }
-    }
-
-    if any_visible { Some(false) } else { None }
 }
 
 #[cfg(test)]
