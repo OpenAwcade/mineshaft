@@ -1,0 +1,71 @@
+name: Rust CI
+
+on:
+  push:
+    branches: ["master"]
+  pull_request:
+
+env:
+  RUSTFLAGS: -Dwarnings
+  CARGO_INCREMENTAL: 0
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          prefix-key: clippy
+          shared-key: stable
+          cache-on-failure: false
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+
+      - run: cargo clippy --workspace --tests --examples -- -D warnings
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          prefix-key: test
+          shared-key: stable
+          cache-on-failure: false
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+
+      - run: cargo test --workspace
+
+  docs:
+    runs-on: ubuntu-latest
+    env:
+      RUSTDOCFLAGS: -Dwarnings
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rust-docs
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          prefix-key: docs
+          shared-key: stable
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+
+      - run: cargo doc --workspace --no-deps
+
