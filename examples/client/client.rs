@@ -87,10 +87,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         server_addr
     );
 
+    #[cfg(target_os = "windows")]
+    if let Err(e) = platform::ensure_loopback_exempt() {
+        warn!(
+            "Minecraft loopback exemption is missing: {}. Run PowerShell as \
+             Administrator once with: CheckNetIsolation LoopbackExempt -a \
+             -n=Microsoft.MinecraftUWP_8wekyb3d8bbwe",
+            e
+        );
+    }
+
     let my_network_id: u64 = rand::random();
     info!("our network id: {:#x}", my_network_id);
 
-    let discovery = DiscoveryService::new(my_network_id, DiscoveryConfig::default()).await?;
+    let discovery_config = {
+        #[cfg(target_os = "windows")]
+        {
+            // Minecraft for Windows is a UWP app. Keep the signaling socket
+            // on loopback so both directions use 127.0.0.1 explicitly.
+            let mut config = DiscoveryConfig::default();
+            config.bind_addr = "127.0.0.1:0"
+                .parse()
+                .expect("valid Windows loopback bind address");
+            config
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            DiscoveryConfig::default()
+        }
+    };
+    let discovery = DiscoveryService::new(my_network_id, discovery_config).await?;
     discovery.start().await;
     let signaling = discovery.signaling();
 

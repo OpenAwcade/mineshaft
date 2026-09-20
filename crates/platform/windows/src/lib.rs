@@ -117,23 +117,25 @@ mod imp {
     }
 
     pub fn ensure_loopback_exempt_impl() -> Result<()> {
-        let status = Command::new("CheckNetIsolation.exe")
-            .args([
-                "LoopbackExempt",
-                "-a",
-                "-n=Microsoft.MinecraftUWP_8wekyb3d8bbwe",
-            ])
-            .status()
-            .map_err(PlatformError::Io)?;
-
-        if status.success() {
-            Ok(())
-        } else {
-            Err(PlatformError::Command(format!(
-                "CheckNetIsolation exited with status {}",
-                status
-            )))
+        let packages = [
+            "Microsoft.MinecraftUWP_8wekyb3d8bbwe",
+            "Microsoft.MinecraftWindowsBeta_8wekyb3d8bbwe",
+        ];
+        let mut last_status = None;
+        for package in packages {
+            let status = Command::new("CheckNetIsolation.exe")
+                .args(["LoopbackExempt", "-a", &format!("-n={package}")])
+                .status()
+                .map_err(PlatformError::Io)?;
+            if status.success() {
+                return Ok(());
+            }
+            last_status = Some(status);
         }
+        Err(PlatformError::Command(format!(
+            "CheckNetIsolation exited with status {} for all Minecraft packages",
+            last_status.expect("packages is non-empty")
+        )))
     }
 }
 
