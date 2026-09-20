@@ -389,6 +389,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 }
             }
             (GameState::Browsing, _) => {
+                // Clear this before handling any remote signaling. A stale game
+                // id from a previous world would make inject_signal treat this
+                // node as a host and deliver joiner-side answers to the wrong
+                // recipient.
+                *local_game_id.lock().await = None;
                 if hosting_registered {
                     info!("user left world, now browsing — unregistering host");
                     send_or_drop(
@@ -400,7 +405,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     .await;
                     hosting_registered = false;
                     registered_advertisement = None;
-                    *local_game_id.lock().await = None;
                 }
                 debug!("user browsing; requesting host list");
                 match fetch_host_list(&mut server, &server_incoming).await {
@@ -446,16 +450,17 @@ async fn inject_signal(
     data: String,
 ) {
     // Who should the game think this is from, and who receives it?
-    let (sender, recipient) = if let Some(game_id) = *local_game_id.lock().await {
-        // we are hosting: present the joiner as the sender, our game receives
-        (joiner_network_id, game_id)
-    } else if let Some((game_id, target)) = join_conns.get(&connection_id).map(|e| *e) {
-        // we are joining: present the advertised server as the sender
-        (target, game_id)
-    } else {
-        warn!("no route for signal conn {}", connection_id);
-        return;
-    };
+    let (sender, recipient) =
+        if let Some((game_id, target)) = join_conns.get(&connection_id).map(|e| *e) {
+            // we are joining: present the advertised server as the sender
+            (target, game_id)
+        } else if let Some(game_id) = *local_game_id.lock().await {
+            // we are hosting: present the joiner as the sender, our game receives
+            (joiner_network_id, game_id)
+        } else {
+            warn!("no route for signal conn {}", connection_id);
+            return;
+        };
 
     let packet = MessagePacket::new(recipient, data);
     match discovery::encode(&Packets::Message(packet), sender) {
@@ -488,8 +493,7 @@ async fn send_to_local_game(socket: &tokio::net::UdpSocket, bytes: &[u8]) -> boo
     sent
 }
 
-type SharedIncoming =
-    Arc<tokio::sync::Mutex<Option<tokio::sync::mpsc::Receiver<ServerMessage>>>>;
+type SharedIncoming = Arc<tokio::sync::Mutex<Option<tokio::sync::mpsc::Receiver<ServerMessage>>>>;
 
 /// Send a message over the persistent connection; drop it on failure so the
 /// next loop iteration reconnects.

@@ -173,7 +173,9 @@ async fn handle_client(
                     addr, server.data.server_name, server.data.level_name, server.sender_id
                 );
                 registry.hosts.insert(server.sender_id, addr);
-                registry.host_records.insert(server.sender_id, server.clone());
+                registry
+                    .host_records
+                    .insert(server.sender_id, server.clone());
                 send_to(
                     &registry,
                     addr,
@@ -183,13 +185,14 @@ async fn handle_client(
                 );
             }
             ClientMessage::UpdateHost(server) => {
-                let updated =
-                    if registry.hosts.get(&server.sender_id).as_deref() == Some(&addr) {
-                        registry.host_records.insert(server.sender_id, server.clone());
-                        true
-                    } else {
-                        false
-                    };
+                let updated = if registry.hosts.get(&server.sender_id).as_deref() == Some(&addr) {
+                    registry
+                        .host_records
+                        .insert(server.sender_id, server.clone());
+                    true
+                } else {
+                    false
+                };
                 if updated {
                     info!(
                         "client {} updated host '{}'/'{}' ({} players, {:#x})",
