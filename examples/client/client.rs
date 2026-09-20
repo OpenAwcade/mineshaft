@@ -127,18 +127,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 // Is this from our local game? While browsing, offers come from
                 // the game's 7551 socket and target an advertised server.
                 let target = signaling.join_target(conn).await;
-                let from_local_game = target.is_some()
-                    || local_game_id
-                        .lock()
-                        .await
-                        .map(|id| id == sender)
-                        .unwrap_or(false);
+                let hosted_game = local_game_id
+                    .lock()
+                    .await
+                    .map(|id| id == sender)
+                    .unwrap_or(false);
+                let from_local_game = hosted_game || target.is_some();
 
                 if !from_local_game {
                     continue;
                 }
 
-                let target_id = if let Some(t) = target {
+                let target_id = if hosted_game {
+                    // host side: server routes back through the connection map
+                    0
+                } else if let Some(t) = target {
                     // joiner side: remember who the game clicked + the game's id
                     if join_conns.len() >= MAX_JOIN_CONNS {
                         warn!("join connection map full; dropping oldest entry");
@@ -149,8 +152,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     join_conns.insert(conn, (sender, t));
                     t
                 } else {
-                    // host side: local game answering; server routes by conn id
-                    0
+                    unreachable!("from_local_game implies a target or hosted game")
                 };
 
                 info!(
